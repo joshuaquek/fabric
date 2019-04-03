@@ -11,12 +11,14 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/core/chaincode/platforms/ccmetadata"
 	"github.com/pkg/errors"
 )
 
@@ -28,21 +30,34 @@ var javaExcludeFileTypes = map[string]bool{
 	".class": true,
 }
 
-func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, includeFileTypeMap map[string]bool, excludeFileTypeMap map[string]bool) error {
+// WriteFolderToTarPackage writes source files to a tarball.
+// This utility is used for node js chaincode packaging, but not golang chaincode.
+// Golang chaincode has more sophisticated file packaging, as implemented in golang/platform.go.
+func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDirs []string, includeFileTypeMap map[string]bool, excludeFileTypeMap map[string]bool) error {
 	fileCount := 0
 	rootDirectory := srcPath
-	vmLogger.Infof("rootDirectory = %s", rootDirectory)
+
+	// trim trailing slash if it was passed
+	if rootDirectory[len(rootDirectory)-1] == '/' {
+		rootDirectory = rootDirectory[:len(rootDirectory)-1]
+	}
+
+	vmLogger.Debugf("rootDirectory = %s", rootDirectory)
 
 	//append "/" if necessary
-	if excludeDir != "" && strings.LastIndex(excludeDir, "/") < len(excludeDir)-1 {
-		excludeDir = excludeDir + "/"
+	updatedExcludeDirs := make([]string, 0)
+	for _, excludeDir := range excludeDirs {
+		if excludeDir != "" && strings.LastIndex(excludeDir, "/") < len(excludeDir)-1 {
+			excludeDir = excludeDir + "/"
+			updatedExcludeDirs = append(updatedExcludeDirs, excludeDir)
+		}
 	}
 
 	rootDirLen := len(rootDirectory)
-	walkFn := func(path string, info os.FileInfo, err error) error {
+	walkFn := func(localpath string, info os.FileInfo, err error) error {
 
-		// If path includes .git, ignore
-		if strings.Contains(path, ".git") {
+		// If localpath includes .git, ignore
+		if strings.Contains(localpath, ".git") {
 			return nil
 		}
 
@@ -51,15 +66,16 @@ func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, 
 		}
 
 		//exclude any files with excludeDir prefix. They should already be in the tar
-		if excludeDir != "" && strings.Index(path, excludeDir) == rootDirLen+1 {
-			//1 for "/"
-			return nil
+		for _, excludeDir := range updatedExcludeDirs {
+			if strings.Index(localpath, excludeDir) == rootDirLen+1 {
+				return nil
+			}
 		}
 		// Because of scoping we can reference the external rootDirectory variable
-		if len(path[rootDirLen:]) == 0 {
+		if len(localpath[rootDirLen:]) == 0 {
 			return nil
 		}
-		ext := filepath.Ext(path)
+		ext := filepath.Ext(localpath)
 
 		if includeFileTypeMap != nil {
 			// we only want 'fileTypes' source files at this point
@@ -75,16 +91,44 @@ func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, 
 			}
 		}
 
-		newPath := fmt.Sprintf("src%s", path[rootDirLen:])
-		//newPath := path[len(rootDirectory):]
+		var packagepath string
 
-		err = WriteFileToPackage(path, newPath, tw)
+		// if file is metadata, keep the /META-INF directory, e.g: META-INF/statedb/couchdb/indexes/indexOwner.json
+		// otherwise file is source code, put it in /src dir, e.g: src/marbles_chaincode.js
+		if strings.HasPrefix(localpath, filepath.Join(rootDirectory, "META-INF")) {
+			packagepath = localpath[rootDirLen+1:]
+
+			// Split the tar packagepath into a tar package directory and filename
+			_, filename := filepath.Split(packagepath)
+
+			// Hidden files are not supported as metadata, therefore ignore them.
+			// User often doesn't know that hidden files are there, and may not be able to delete them, therefore warn user rather than error out.
+			if strings.HasPrefix(filename, ".") {
+				vmLogger.Warningf("Ignoring hidden file in metadata directory: %s", packagepath)
+				return nil
+			}
+
+			fileBytes, errRead := ioutil.ReadFile(localpath)
+			if errRead != nil {
+				return errRead
+			}
+
+			// Validate metadata file for inclusion in tar
+			// Validation is based on the fully qualified path of the file
+			err = ccmetadata.ValidateMetadataFile(packagepath, fileBytes)
+			if err != nil {
+				return err
+			}
+
+		} else { // file is not metadata, include in src
+			packagepath = fmt.Sprintf("src%s", localpath[rootDirLen:])
+		}
+
+		err = WriteFileToPackage(localpath, packagepath, tw)
 		if err != nil {
 			return fmt.Errorf("Error writing file to package: %s", err)
 		}
 		fileCount++
-
-		vmLogger.Debugf("Writing file %s to tar", newPath)
 
 		return nil
 	}
@@ -105,7 +149,7 @@ func WriteJavaProjectToPackage(tw *tar.Writer, srcPath string) error {
 
 	vmLogger.Debugf("Packaging Java project from path %s", srcPath)
 
-	if err := WriteFolderToTarPackage(tw, srcPath, "", nil, javaExcludeFileTypes); err != nil {
+	if err := WriteFolderToTarPackage(tw, srcPath, []string{"target", "build", "out"}, nil, javaExcludeFileTypes); err != nil {
 
 		vmLogger.Errorf("Error writing folder to tar package %s", err)
 		return err
@@ -120,6 +164,7 @@ func WriteJavaProjectToPackage(tw *tar.Writer, srcPath string) error {
 
 //WriteFileToPackage writes a file to the tarball
 func WriteFileToPackage(localpath string, packagepath string, tw *tar.Writer) error {
+	vmLogger.Debug("Writing file to tarball:", packagepath)
 	fd, err := os.Open(localpath)
 	if err != nil {
 		return fmt.Errorf("%s: %s", localpath, err)
@@ -166,7 +211,15 @@ func WriteStreamToPackage(is io.Reader, localpath string, packagepath string, tw
 func WriteBytesToPackage(name string, payload []byte, tw *tar.Writer) error {
 	//Make headers identical by using zero time
 	var zeroTime time.Time
-	tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(payload)), ModTime: zeroTime, AccessTime: zeroTime, ChangeTime: zeroTime})
+	tw.WriteHeader(
+		&tar.Header{
+			Name:       name,
+			Size:       int64(len(payload)),
+			ModTime:    zeroTime,
+			AccessTime: zeroTime,
+			ChangeTime: zeroTime,
+			Mode:       0100644,
+		})
 	tw.Write(payload)
 
 	return nil

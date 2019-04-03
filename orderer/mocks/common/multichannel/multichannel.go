@@ -25,7 +25,10 @@ type ConsenterSupport struct {
 	// BlockCutterVal is the value returned by BlockCutter()
 	BlockCutterVal *mockblockcutter.Receiver
 
-	// Blocks is the channel where WriteBlock writes the most recently created block
+	// BlockByIndex maps block numbers to retrieved values of these blocks
+	BlockByIndex map[uint64]*cb.Block
+
+	// Blocks is the channel where WriteBlock writes the most recently created block,
 	Blocks chan *cb.Block
 
 	// ChainIDVal is the value returned by ChainID()
@@ -60,6 +63,16 @@ type ConsenterSupport struct {
 
 	// SequenceVal is returned by Sequence
 	SequenceVal uint64
+
+	// BlockVerificationErr is returned by VerifyBlockSignature
+	BlockVerificationErr error
+
+	SystemChannelVal bool
+}
+
+// Block returns the block with the given number or nil if not found
+func (mcs *ConsenterSupport) Block(number uint64) *cb.Block {
+	return mcs.BlockByIndex[number]
 }
 
 // BlockCutter returns BlockCutterVal
@@ -89,8 +102,7 @@ func (mcs *ConsenterSupport) WriteBlock(block *cb.Block, encodedMetadataValue []
 	if encodedMetadataValue != nil {
 		block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&cb.Metadata{Value: encodedMetadataValue})
 	}
-	mcs.HeightVal++
-	mcs.Blocks <- block
+	mcs.Append(block)
 }
 
 // WriteConfigBlock calls WriteBlock
@@ -141,4 +153,22 @@ func (mcs *ConsenterSupport) ProcessConfigMsg(env *cb.Envelope) (*cb.Envelope, u
 // Sequence returns SequenceVal
 func (mcs *ConsenterSupport) Sequence() uint64 {
 	return mcs.SequenceVal
+}
+
+// VerifyBlockSignature verifies a signature of a block
+func (mcs *ConsenterSupport) VerifyBlockSignature(_ []*cb.SignedData, _ *cb.ConfigEnvelope) error {
+	return mcs.BlockVerificationErr
+}
+
+// IsSystemChannel returns true if this is the system channel
+func (mcs *ConsenterSupport) IsSystemChannel() bool {
+	return mcs.SystemChannelVal
+}
+
+// Append appends a new block to the ledger in its raw form,
+// unlike WriteBlock that also mutates its metadata.
+func (mcs *ConsenterSupport) Append(block *cb.Block) error {
+	mcs.HeightVal++
+	mcs.Blocks <- block
+	return nil
 }

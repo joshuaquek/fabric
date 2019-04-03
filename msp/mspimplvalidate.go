@@ -9,13 +9,11 @@ package msp
 import (
 	"bytes"
 	"crypto/x509"
-
-	"time"
-
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"math/big"
 	"reflect"
+	"time"
 
 	"github.com/pkg/errors"
 )
@@ -184,8 +182,6 @@ func (msp *bccspmsp) validateIdentityOUsV11(id *identity) error {
 			nodeOU = msp.clientOU
 		case msp.peerOU.OrganizationalUnitIdentifier:
 			nodeOU = msp.peerOU
-		case msp.ordererOU.OrganizationalUnitIdentifier:
-			nodeOU = msp.ordererOU
 		default:
 			continue
 		}
@@ -285,20 +281,4 @@ func getSubjectKeyIdentifierFromCert(cert *x509.Certificate) ([]byte, error) {
 	}
 
 	return nil, errors.New("subjectKeyIdentifier not found in certificate")
-}
-
-// isCACert does a few checks on the certificate,
-// assuming it's a CA; it returns true if all looks good
-// and false otherwise
-func isCACert(cert *x509.Certificate) bool {
-	_, err := getSubjectKeyIdentifierFromCert(cert)
-	if err != nil {
-		return false
-	}
-
-	if !cert.IsCA {
-		return false
-	}
-
-	return true
 }

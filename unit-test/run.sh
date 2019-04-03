@@ -5,94 +5,145 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-
 set -e
-ARCH=`uname -m`
 
-#check job type, do patch set specific unit test when job is verify
-if [ "$JOB_TYPE"  = "VERIFY" ]; then
+# regexes for packages to exclude from unit test
+excluded_packages=(
+    "/integration(/|$)"
+)
 
-  cd $GOPATH/src/github.com/hyperledger/fabric/
+# regexes for packages that must be run serially
+serial_packages=(
+    "github.com/hyperledger/fabric/gossip"
+)
 
-  #figure out what packages should be tested for uncommitted changes
-  # first check for uncommitted changes
-  TEST_PKGS=$(git diff --name-only HEAD * | grep .go$ | grep -v ^vendor/ \
-    | grep -v ^build/ | sed 's%/[^/]*$%/%'| sort -u \
-    | awk '{print "github.com/hyperledger/fabric/"$1"..."}')
+# packages which need to be tested with build tag pluginsenabled
+plugin_packages=(
+    "github.com/hyperledger/fabric/core/scc"
+)
 
-  if [ -z "$TEST_PKGS" ]; then
-    # next check for changes in the latest commit - typically this will
-    # be for CI only, but could also handle a committed change before
-    # pushing to Gerrit
-    TEST_PKGS=$(git diff-tree --no-commit-id --name-only -r $(git log -2 \
-      --pretty=format:"%h") | grep .go$ | grep -v ^vendor/ | grep -v ^build/ \
-      | sed 's%/[^/]*$%/%'| sort -u | \
-      awk '{print "github.com/hyperledger/fabric/"$1"..."}')
-  fi
+# packages which need to be tested with build tag pkcs11
+pkcs11_packages=(
+    "github.com/hyperledger/fabric/bccsp/..."
+)
 
-  #only run the test when test pkgs is not empty
-  if [[ ! -z "$TEST_PKGS" ]]; then
-     echo "Testing packages:"
-     echo $TEST_PKGS
-     echo " with tags " $GO_TAGS
-     # use go test -cover as this is much more efficient than gocov
-     time go test -cover -tags "$GO_TAGS" -ldflags "$GO_LDFLAGS" $TEST_PKGS -short -timeout=20m
-  else
-     echo "Nothing changed in unit test!!!"
-  fi
+# obtain packages changed since some git refspec
+packages_diff() {
+    git -C "${GOPATH}/src/github.com/hyperledger/fabric" diff --no-commit-id --name-only -r "${1:-HEAD}" |
+        grep '.go$' | grep -Ev '^vendor/|^build/' | \
+        sed 's%/[^/]*$%/%' | sort -u | \
+        awk '{print "github.com/hyperledger/fabric/"$1"..."}'
+}
 
-else
+# "go list" packages and filter out excluded packages
+list_and_filter() {
+    local filter=$(local IFS='|' ; echo "${excluded_packages[*]}")
+    if [ -n "$filter" ]; then
+        go list $@ 2>/dev/null | grep -Ev "${filter}" || true
+    else
+        go list $@ 2>/dev/null
+    fi
+}
 
-  #check to see if TEST_PKGS is set else use default (all packages)
-  TEST_PKGS=${TEST_PKGS:-github.com/hyperledger/fabric/...}
-  echo -n "Obtaining list of tests to run for the following packages: ${TEST_PKGS}"
+# remove packages that must be tested serially
+parallel_test_packages() {
+    local filter=$(local IFS='|' ; echo "${serial_packages[*]}")
+    if [ -n "$filter" ]; then
+        echo "$@" | grep -Ev $(local IFS='|' ; echo "${serial_packages[*]}") || true
+    else
+        echo "$@"
+    fi
+}
 
-  # Some examples and packages don't play nice with `go test`
-  PKGS=`go list ${TEST_PKGS} 2> /dev/null | \
-              grep -v /vendor/ | \
-              grep -v /build/ | \
-              grep -v /bccsp/mocks | \
-              grep -v /bddtests | \
-              grep -v /orderer/mocks | \
-              grep -v /orderer/sample_clients | \
-              grep -v /common/mocks | \
-              grep -v /common/ledger/testutil | \
-              grep -v /core/mocks | \
-              grep -v /core/testutil | \
-              grep -v /core/ledger/testutil | \
-              grep -v /core/ledger/kvledger/example | \
-              grep -v /core/ledger/kvledger/marble_example | \
-              grep -v /core/deliverservice/mocks | \
-              # this package's tests need to be mocked
-              grep -v /bccsp/factory | \
-              grep -v github.com/hyperledger/fabric/gossip | \
-              grep -v /test | \
-              grep -v /examples`
+# get packages that must be tested serially
+serial_test_packages() {
+    local filter=$(local IFS='|' ; echo "${serial_packages[*]}")
+    if [ -n "$filter" ]; then
+        echo "$@" | grep -E "${filter}" || true
+    else
+        echo "$@"
+    fi
+}
 
-  if [ x$ARCH == xppc64le -o x$ARCH == xs390x ]; then
-    PKGS=`echo $PKGS | sed  's@'github.com/hyperledger/fabric/core/chaincode/platforms/java/test'@@g'`
-    PKGS=`echo $PKGS | sed  's@'github.com/hyperledger/fabric/core/chaincode/platforms/java'@@g'`
-  fi
+# "go test" the provided packages. Packages that are not present in the serial package list
+# will be tested in parallel
+run_tests() {
+    local flags="-cover"
+    if [ -n "${VERBOSE}" ]; then
+        flags="${flags} -v"
+    fi
 
-  echo -e "\nDONE!"
-  echo -e "Running tests with tags ${GO_TAGS} ..."
+    local race_flags=""
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+        export GORACE=atexit_sleep_ms=0 # reduce overhead of race
+        race_flags="-race"
+    fi
 
-  if [ "$JOB_TYPE"  = "PROFILE" ]; then
-    # Initialize profile.cov
-    date
-    echo "mode: set" > profile.cov
-    for pkg in $PKGS
-    do
-      :> profile_tmp.cov
-      go test -cover -coverprofile=profile_tmp.cov -tags "$GO_TAGS" -ldflags "$GO_LDFLAGS" $pkg -timeout=20m
-      tail -n +2 profile_tmp.cov >> profile.cov || echo "Unable to append coverage for $pkg"
-    done
-    #convert to cobertura format
-    gocov convert profile.cov |gocov-xml > report.xml
-    date
-  else
-    time go test -cover -tags "$GO_TAGS" -ldflags "$GO_LDFLAGS" $PKGS -short -timeout=20m
-    # gossip packages need to be serialized
-    time go test -cover -tags "$GO_TAGS" -ldflags "$GO_LDFLAGS" ./gossip/... -short -p 1 -timeout=20m
-  fi
-fi
+    echo ${GO_TAGS}
+
+    time {
+        local parallel=$(parallel_test_packages "$@")
+        if [ -n "${parallel}" ]; then
+            go test ${flags} ${race_flags} -tags "$GO_TAGS" ${parallel[@]} -short -timeout=20m
+        fi
+
+        local serial=$(serial_test_packages "$@") # race is disabled as well
+        if [ -n "${serial}" ]; then
+            go test ${flags} -tags "$GO_TAGS" ${serial[@]} -short -p 1 -timeout=20m
+        fi
+    }
+}
+
+# "go test" the provided packages and generate code coverage reports.
+run_tests_with_coverage() {
+    # run the tests serially
+    time go test -p 1 -cover -coverprofile=profile_tmp.cov -tags "$GO_TAGS" $@ -timeout=20m
+    tail -n +2 profile_tmp.cov >> profile.cov && rm profile_tmp.cov
+}
+
+main() {
+    # place the cache directory into the default build tree if it exists
+    if [ -d "${GOPATH}/src/github.com/hyperledger/fabric/.build" ]; then
+        export GOCACHE="${GOPATH}/src/github.com/hyperledger/fabric/.build/go-cache"
+    fi
+
+    # default behavior is to run all tests
+    local package_spec=${TEST_PKGS:-github.com/hyperledger/fabric/...}
+
+    # extra exclusions for ppc and s390x
+    local arch=`uname -m`
+    if [ x${arch} == xppc64le -o x${arch} == xs390x ]; then
+        excluded_packages+=("github.com/hyperledger/fabric/core/chaincode/platforms/java")
+    fi
+
+    # when running a "verify" job, only test packages that have changed
+    if [ "${JOB_TYPE}" = "VERIFY" ]; then
+        # first check for uncommitted changes
+        package_spec=$(packages_diff HEAD)
+        if [ -z "${package_spec}" ]; then
+            # next check for changes in the latest commit - typically this will
+            # be for CI only, but could also handle a committed change before
+            # pushing to Gerrit
+            package_spec=$(packages_diff HEAD^)
+        fi
+    fi
+
+    # expand the package spec into an array of packages
+    local -a packages=$(list_and_filter ${package_spec})
+
+    if [ -z "${packages}" ]; then
+        echo "Nothing to test!!!"
+    elif [ "${JOB_TYPE}" = "PROFILE" ]; then
+        echo "mode: set" > profile.cov
+        run_tests_with_coverage "${packages[@]}"
+        GO_TAGS="${GO_TAGS} pluginsenabled" run_tests_with_coverage "${plugin_packages[@]}"
+        GO_TAGS="${GO_TAGS} pkcs11" run_tests_with_coverage "${pkcs11_packages[@]}"
+        gocov convert profile.cov | gocov-xml > report.xml
+    else
+        run_tests "${packages[@]}"
+        GO_TAGS="${GO_TAGS} pluginsenabled" run_tests "${plugin_packages[@]}"
+        GO_TAGS="${GO_TAGS} pkcs11" run_tests "${pkcs11_packages[@]}"
+    fi
+}
+
+main

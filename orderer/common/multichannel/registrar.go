@@ -11,34 +11,29 @@ package multichannel
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/crypto"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
+	"github.com/hyperledger/fabric/common/metrics"
+	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	"github.com/hyperledger/fabric/orderer/consensus"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
-
-	"github.com/op/go-logging"
 	"github.com/pkg/errors"
 )
 
 const (
-	pkgLogID = "orderer/commmon/multichannel"
-
 	msgVersion = int32(0)
 	epoch      = 0
 )
 
-var logger *logging.Logger
-
-func init() {
-	logger = flogging.MustGetLogger(pkgLogID)
-}
+var logger = flogging.MustGetLogger("orderer.commmon.multichannel")
 
 // checkResources makes sure that the channel config is compatible with this binary and logs sanity checks
 func checkResources(res channelconfig.Resources) error {
@@ -96,17 +91,22 @@ type ledgerResources struct {
 
 // Registrar serves as a point of access and control for the individual channel resources.
 type Registrar struct {
-	chains          map[string]*ChainSupport
-	consenters      map[string]consensus.Consenter
-	ledgerFactory   blockledger.Factory
-	signer          crypto.LocalSigner
-	systemChannelID string
-	systemChannel   *ChainSupport
-	templator       msgprocessor.ChannelConfigTemplator
-	callbacks       []func(bundle *channelconfig.Bundle)
+	lock   sync.RWMutex
+	chains map[string]*ChainSupport
+
+	consenters         map[string]consensus.Consenter
+	ledgerFactory      blockledger.Factory
+	signer             crypto.LocalSigner
+	blockcutterMetrics *blockcutter.Metrics
+	systemChannelID    string
+	systemChannel      *ChainSupport
+	templator          msgprocessor.ChannelConfigTemplator
+	callbacks          []channelconfig.BundleActor
 }
 
-func getConfigTx(reader blockledger.Reader) *cb.Envelope {
+// ConfigBlock retrieves the last configuration block from the given ledger.
+// Panics on failure.
+func ConfigBlock(reader blockledger.Reader) *cb.Block {
 	lastBlock := blockledger.GetBlock(reader, reader.Height()-1)
 	index, err := utils.GetLastConfigIndexFromBlock(lastBlock)
 	if err != nil {
@@ -117,27 +117,41 @@ func getConfigTx(reader blockledger.Reader) *cb.Envelope {
 		logger.Panicf("Config block does not exist")
 	}
 
-	return utils.ExtractEnvelopeOrPanic(configBlock, 0)
+	return configBlock
+}
+
+func configTx(reader blockledger.Reader) *cb.Envelope {
+	return utils.ExtractEnvelopeOrPanic(ConfigBlock(reader), 0)
 }
 
 // NewRegistrar produces an instance of a *Registrar.
-func NewRegistrar(ledgerFactory blockledger.Factory, consenters map[string]consensus.Consenter,
-	signer crypto.LocalSigner, callbacks ...func(bundle *channelconfig.Bundle)) *Registrar {
+func NewRegistrar(ledgerFactory blockledger.Factory,
+	signer crypto.LocalSigner, metricsProvider metrics.Provider, callbacks ...channelconfig.BundleActor) *Registrar {
 	r := &Registrar{
-		chains:        make(map[string]*ChainSupport),
-		ledgerFactory: ledgerFactory,
-		consenters:    consenters,
-		signer:        signer,
-		callbacks:     callbacks,
+		chains:             make(map[string]*ChainSupport),
+		ledgerFactory:      ledgerFactory,
+		signer:             signer,
+		blockcutterMetrics: blockcutter.NewMetrics(metricsProvider),
+		callbacks:          callbacks,
 	}
 
-	existingChains := ledgerFactory.ChainIDs()
+	return r
+}
+
+func (r *Registrar) Initialize(consenters map[string]consensus.Consenter) {
+	r.consenters = consenters
+	existingChains := r.ledgerFactory.ChainIDs()
+
+	//TODO To initialize after consensus-type migration, it is necessary to identify the system channel and create it first,
+	// determining the correct consensus-type and the state of the migration. This is needed for recovery, in case the
+	// migration process crashes before it is committed.
+
 	for _, chainID := range existingChains {
-		rl, err := ledgerFactory.GetOrCreate(chainID)
+		rl, err := r.ledgerFactory.GetOrCreate(chainID)
 		if err != nil {
 			logger.Panicf("Ledger factory reported chainID %s but could not retrieve it: %s", chainID, err)
 		}
-		configTx := getConfigTx(rl)
+		configTx := configTx(rl)
 		if configTx == nil {
 			logger.Panic("Programming error, configTx should never be nil here")
 		}
@@ -148,11 +162,14 @@ func NewRegistrar(ledgerFactory blockledger.Factory, consenters map[string]conse
 			if r.systemChannelID != "" {
 				logger.Panicf("There appear to be two system chains %s and %s", r.systemChannelID, chainID)
 			}
+
 			chain := newChainSupport(
 				r,
 				ledgerResources,
-				consenters,
-				signer)
+				r.consenters,
+				r.signer,
+				r.blockcutterMetrics,
+			)
 			r.templator = msgprocessor.NewDefaultTemplator(chain)
 			chain.Processor = msgprocessor.NewSystemChannel(chain, r.templator, msgprocessor.CreateSystemChannelFilters(r, chain))
 
@@ -166,7 +183,8 @@ func NewRegistrar(ledgerFactory blockledger.Factory, consenters map[string]conse
 			if status != cb.Status_SUCCESS {
 				logger.Panicf("Error reading genesis block of system channel '%s'", chainID)
 			}
-			logger.Infof("Starting system channel '%s' with genesis block hash %x and orderer type %s", chainID, genesisBlock.Header.Hash(), chain.SharedConfig().ConsensusType())
+			logger.Infof("Starting system channel '%s' with genesis block hash %x and orderer type %s",
+				chainID, genesisBlock.Header.Hash(), chain.SharedConfig().ConsensusType())
 
 			r.chains[chainID] = chain
 			r.systemChannelID = chainID
@@ -178,8 +196,10 @@ func NewRegistrar(ledgerFactory blockledger.Factory, consenters map[string]conse
 			chain := newChainSupport(
 				r,
 				ledgerResources,
-				consenters,
-				signer)
+				r.consenters,
+				r.signer,
+				r.blockcutterMetrics,
+			)
 			r.chains[chainID] = chain
 			chain.start()
 		}
@@ -189,8 +209,6 @@ func NewRegistrar(ledgerFactory blockledger.Factory, consenters map[string]conse
 	if r.systemChannelID == "" {
 		logger.Panicf("No system chain found.  If bootstrapping, does your system channel contain a consortiums group definition?")
 	}
-
-	return r
 }
 
 // SystemChannelID returns the ChannelID for the system channel.
@@ -207,8 +225,13 @@ func (r *Registrar) BroadcastChannelSupport(msg *cb.Envelope) (*cb.ChannelHeader
 		return nil, false, nil, fmt.Errorf("could not determine channel ID: %s", err)
 	}
 
-	cs, ok := r.chains[chdr.ChannelId]
-	if !ok {
+	cs := r.GetChain(chdr.ChannelId)
+	// New channel creation
+	if cs == nil {
+		// Prevent channel creation during consensus-type migration
+		if r.ConsensusMigrationPending() {
+			return chdr, true, nil, errors.New("cannot create channel because consensus-type migration is pending")
+		}
 		cs = r.systemChannel
 	}
 
@@ -216,16 +239,82 @@ func (r *Registrar) BroadcastChannelSupport(msg *cb.Envelope) (*cb.ChannelHeader
 	switch cs.ClassifyMsg(chdr) {
 	case msgprocessor.ConfigUpdateMsg:
 		isConfig = true
+	case msgprocessor.ConfigMsg:
+		return chdr, false, nil, errors.New("message is of type that cannot be processed directly")
 	default:
 	}
 
 	return chdr, isConfig, cs, nil
 }
 
-// GetChain retrieves the chain support for a chain (and whether it exists)
-func (r *Registrar) GetChain(chainID string) (*ChainSupport, bool) {
-	cs, ok := r.chains[chainID]
-	return cs, ok
+// ConsensusMigrationPending checks whether consensus-type migration is started on the system channel.
+func (r *Registrar) ConsensusMigrationPending() bool {
+	//Note: systemChannel.MigrationStatus().IsPending() is thread safe, takes a mutex
+	return r.systemChannel.MigrationStatus().IsPending()
+}
+
+// ConsensusMigrationStart checks whether consensus-type migration had started,
+// and then marks all standard channels as started.
+func (r *Registrar) ConsensusMigrationStart(context uint64) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	for id, chain := range r.chains {
+		if id != r.systemChannel.ChainID() && chain.MigrationStatus().IsPending() {
+			return errors.Errorf("cannot start new consensus-type migration because standard channel %s, still pending", id)
+		}
+	}
+
+	for _, chain := range r.chains {
+		chain.MigrationStatus().SetStateContext(ab.ConsensusType_MIG_STATE_START, context)
+	}
+	logger.Debugf("Consensus-type migration: all standard channels marked as started, context=%d", context)
+
+	return nil
+}
+
+// ConsensusMigrationCommit checks pre-conditions and commits the consensus-type migration.
+func (r *Registrar) ConsensusMigrationCommit() error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	sysState, sysContext := r.systemChannel.MigrationStatus().StateContext()
+	if !(sysState == ab.ConsensusType_MIG_STATE_START && sysContext > 0) {
+		return errors.Errorf("cannot commit consensus-type migration because system channel (%s): state=%s, context=%d (expect: state=%s, context>0)",
+			r.systemChannel.ChainID(), sysState, sysContext, ab.ConsensusType_MIG_STATE_START)
+	}
+
+	for id, chain := range r.chains {
+		st, ctx := chain.MigrationStatus().StateContext()
+		if id == r.systemChannel.ChainID() {
+			continue
+		}
+		if st != ab.ConsensusType_MIG_STATE_CONTEXT {
+			return errors.Errorf("cannot commit consensus-type migration because standard channel %s, still pending, state=%s", id, st)
+		}
+		if ctx != sysContext {
+			return errors.Errorf("cannot commit consensus-type migration because standard channel %s, bad context=%d, expected=%d", id, ctx, sysContext)
+		}
+	}
+
+	r.systemChannel.MigrationStatus().SetStateContext(ab.ConsensusType_MIG_STATE_COMMIT, sysContext)
+	logger.Debugf("Consensus-type migration: system channel marked as committed, context=%d", sysContext)
+
+	return nil
+}
+
+// ConsensusMigrationAbort checks pre-conditions and aborts the consensus-type migration.
+func (r *Registrar) ConsensusMigrationAbort() (err error) {
+	//TODO implement the consensus-type migration abort path
+	return fmt.Errorf("Not implemented yet")
+}
+
+// GetChain retrieves the chain support for a chain if it exists.
+func (r *Registrar) GetChain(chainID string) *ChainSupport {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	return r.chains[chainID]
 }
 
 func (r *Registrar) newLedgerResources(configTx *cb.Envelope) *ledgerResources {
@@ -268,9 +357,30 @@ func (r *Registrar) newLedgerResources(configTx *cb.Envelope) *ledgerResources {
 	}
 }
 
+// CreateChain makes the Registrar create a chain with the given name.
+func (r *Registrar) CreateChain(chainName string) {
+	lf, err := r.ledgerFactory.GetOrCreate(chainName)
+	if err != nil {
+		logger.Panicf("Failed obtaining ledger factory for %s: %v", chainName, err)
+	}
+	chain := r.GetChain(chainName)
+	if chain != nil {
+		logger.Infof("A chain of type %T for channel %s already exists. "+
+			"Halting it.", chain.Chain, chainName)
+		chain.Halt()
+	}
+	r.newChain(configTx(lf))
+}
+
 func (r *Registrar) newChain(configtx *cb.Envelope) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
 	ledgerResources := r.newLedgerResources(configtx)
-	ledgerResources.Append(blockledger.CreateNextBlock(ledgerResources, []*cb.Envelope{configtx}))
+	// If we have no blocks, we need to create the genesis block ourselves.
+	if ledgerResources.Height() == 0 {
+		ledgerResources.Append(blockledger.CreateNextBlock(ledgerResources, []*cb.Envelope{configtx}))
+	}
 
 	// Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is
 	newChains := make(map[string]*ChainSupport)
@@ -278,7 +388,7 @@ func (r *Registrar) newChain(configtx *cb.Envelope) {
 		newChains[key] = value
 	}
 
-	cs := newChainSupport(r, ledgerResources, r.consenters, r.signer)
+	cs := newChainSupport(r, ledgerResources, r.consenters, r.signer, r.blockcutterMetrics)
 	chainID := ledgerResources.ConfigtxValidator().ChainID()
 
 	logger.Infof("Created and starting new chain %s", chainID)
@@ -291,6 +401,9 @@ func (r *Registrar) newChain(configtx *cb.Envelope) {
 
 // ChannelsCount returns the count of the current total number of channels.
 func (r *Registrar) ChannelsCount() int {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
 	return len(r.chains)
 }
 

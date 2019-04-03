@@ -17,6 +17,13 @@ import (
 type Orderer struct {
 	// ConsensusTypeVal is returned as the result of ConsensusType()
 	ConsensusTypeVal string
+	// ConsensusMetadataVal is returned as the result of ConsensusMetadata()
+	ConsensusMetadataVal []byte
+
+	ConsensusTypeMigrationStateVal ab.ConsensusType_MigrationState
+
+	ConsensusTypeMigrationContextVal uint64
+
 	// BatchSizeVal is returned as the result of BatchSize()
 	BatchSizeVal *ab.BatchSize
 	// BatchTimeoutVal is returned as the result of BatchTimeout()
@@ -32,38 +39,53 @@ type Orderer struct {
 }
 
 // ConsensusType returns the ConsensusTypeVal
-func (scm *Orderer) ConsensusType() string {
-	return scm.ConsensusTypeVal
+func (o *Orderer) ConsensusType() string {
+	return o.ConsensusTypeVal
+}
+
+// ConsensusMetadata returns the ConsensusMetadataVal
+func (o *Orderer) ConsensusMetadata() []byte {
+	return o.ConsensusMetadataVal
+}
+
+// ConsensusMigrationState returns the ConsensusTypeMigrationStateVal
+func (o *Orderer) ConsensusMigrationState() ab.ConsensusType_MigrationState {
+	return o.ConsensusTypeMigrationStateVal
+}
+
+// ConsensusMigrationContext returns the ConsensusTypeMigrationContextVal
+func (o *Orderer) ConsensusMigrationContext() uint64 {
+	return o.ConsensusTypeMigrationContextVal
 }
 
 // BatchSize returns the BatchSizeVal
-func (scm *Orderer) BatchSize() *ab.BatchSize {
-	return scm.BatchSizeVal
+func (o *Orderer) BatchSize() *ab.BatchSize {
+	return o.BatchSizeVal
 }
 
 // BatchTimeout returns the BatchTimeoutVal
-func (scm *Orderer) BatchTimeout() time.Duration {
-	return scm.BatchTimeoutVal
+func (o *Orderer) BatchTimeout() time.Duration {
+	return o.BatchTimeoutVal
 }
 
 // KafkaBrokers returns the KafkaBrokersVal
-func (scm *Orderer) KafkaBrokers() []string {
-	return scm.KafkaBrokersVal
+func (o *Orderer) KafkaBrokers() []string {
+	return o.KafkaBrokersVal
 }
 
 // MaxChannelsCount returns the MaxChannelsCountVal
-func (scm *Orderer) MaxChannelsCount() uint64 {
-	return scm.MaxChannelsCountVal
+func (o *Orderer) MaxChannelsCount() uint64 {
+	return o.MaxChannelsCountVal
 }
 
 // Organizations returns OrganizationsVal
-func (scm *Orderer) Organizations() map[string]channelconfig.Org {
-	return scm.OrganizationsVal
+func (o *Orderer) Organizations() map[string]channelconfig.Org {
+	return o.OrganizationsVal
 }
 
 // Capabilities returns CapabilitiesVal
-func (scm *Orderer) Capabilities() channelconfig.OrdererCapabilities {
-	return scm.CapabilitiesVal
+func (o *Orderer) Capabilities() channelconfig.OrdererCapabilities {
+	return o.CapabilitiesVal
 }
 
 // OrdererCapabilities mocks the channelconfig.OrdererCapabilities interface
@@ -71,11 +93,16 @@ type OrdererCapabilities struct {
 	// SupportedErr is returned by Supported()
 	SupportedErr error
 
-	// SetChannelModPolicyDuringCreateVal is returned by SetChannelModPolicyDuringCreate()
-	SetChannelModPolicyDuringCreateVal bool
+	// PredictableChannelTemplateVal is returned by PredictableChannelTemplate()
+	PredictableChannelTemplateVal bool
 
 	// ResubmissionVal is returned by Resubmission()
 	ResubmissionVal bool
+
+	// ExpirationVal is returned by ExpirationCheck()
+	ExpirationVal bool
+
+	Kafka2RaftMigVal bool
 }
 
 // Supported returns SupportedErr
@@ -83,12 +110,23 @@ func (oc *OrdererCapabilities) Supported() error {
 	return oc.SupportedErr
 }
 
-// SetChannelModPolicyDuringCreate returns SetChannelModPolicyDuringCreateVal
-func (oc *OrdererCapabilities) SetChannelModPolicyDuringCreate() bool {
-	return oc.SetChannelModPolicyDuringCreateVal
+// PredictableChannelTemplate returns PredictableChannelTemplateVal
+func (oc *OrdererCapabilities) PredictableChannelTemplate() bool {
+	return oc.PredictableChannelTemplateVal
 }
 
 // Resubmission returns ResubmissionVal
 func (oc *OrdererCapabilities) Resubmission() bool {
 	return oc.ResubmissionVal
+}
+
+// ExpirationCheck specifies whether the orderer checks for identity expiration checks
+// when validating messages
+func (oc *OrdererCapabilities) ExpirationCheck() bool {
+	return oc.ExpirationVal
+}
+
+// Kafka2RaftMigration checks whether the orderer permits a kafka to raft migration.
+func (oc *OrdererCapabilities) Kafka2RaftMigration() bool {
+	return oc.Kafka2RaftMigVal
 }

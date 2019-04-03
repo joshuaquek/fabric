@@ -10,14 +10,8 @@ import (
 	"testing"
 
 	cb "github.com/hyperledger/fabric/protos/common"
-
-	"github.com/op/go-logging"
 	"github.com/stretchr/testify/assert"
 )
-
-func init() {
-	logging.SetLevel(logging.DEBUG, pkgLogID)
-}
 
 func TestSatisfied(t *testing.T) {
 	var capsMap map[string]*cb.Capability
@@ -32,7 +26,7 @@ func TestSatisfied(t *testing.T) {
 
 func TestNotSatisfied(t *testing.T) {
 	capsMap := map[string]*cb.Capability{
-		"FakeCapability": &cb.Capability{},
+		"FakeCapability": {},
 	}
 	for _, provider := range []*registry{
 		NewChannelProvider(capsMap).registry,

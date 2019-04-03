@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package multichannel
@@ -22,9 +12,13 @@ import (
 	newchannelconfig "github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/crypto"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
+	ramledger "github.com/hyperledger/fabric/common/ledger/blockledger/ram"
 	mockconfigtx "github.com/hyperledger/fabric/common/mocks/configtx"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/configtxgentest"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/encoder"
 	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
 	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
 	"github.com/stretchr/testify/assert"
 )
@@ -35,7 +29,9 @@ type mockBlockWriterSupport struct {
 	blockledger.ReadWriter
 }
 
-func (mbws mockBlockWriterSupport) Update(bundle *newchannelconfig.Bundle) {}
+func (mbws mockBlockWriterSupport) Update(bundle *newchannelconfig.Bundle) {
+	mbws.Validator.SequenceVal++
+}
 
 func (mbws mockBlockWriterSupport) CreateBundle(channelID string, config *cb.Config) (*newchannelconfig.Bundle, error) {
 	return nil, nil
@@ -56,17 +52,38 @@ func TestCreateBlock(t *testing.T) {
 }
 
 func TestBlockSignature(t *testing.T) {
+	rlf := ramledger.New(2)
+	l, err := rlf.GetOrCreate("mychannel")
+	assert.NoError(t, err)
+	lastBlock := cb.NewBlock(0, nil)
+	l.Append(lastBlock)
+
 	bw := &BlockWriter{
+		lastConfigBlockNum: 42,
 		support: &mockBlockWriterSupport{
 			LocalSigner: mockCrypto(),
+			Validator:   &mockconfigtx.Validator{},
+			ReadWriter:  l,
 		},
+		lastBlock: cb.NewBlock(1, lastBlock.Header.Hash()),
 	}
 
-	block := cb.NewBlock(7, []byte("foo"))
-	bw.addBlockSignature(block)
+	consensusMetadata := []byte("bar")
+	bw.commitBlock(consensusMetadata)
 
-	md := utils.GetMetadataFromBlockOrPanic(block, cb.BlockMetadataIndex_SIGNATURES)
-	assert.Nil(t, md.Value, "Value is empty in this case")
+	it, seq := l.Iterator(&orderer.SeekPosition{Type: &orderer.SeekPosition_Newest{}})
+	assert.Equal(t, uint64(1), seq)
+	committedBlock, status := it.Next()
+	assert.Equal(t, cb.Status_SUCCESS, status)
+
+	md := utils.GetMetadataFromBlockOrPanic(committedBlock, cb.BlockMetadataIndex_SIGNATURES)
+
+	expectedMetadataValue := utils.MarshalOrPanic(&cb.OrdererBlockMetadata{
+		LastConfig:        &cb.LastConfig{Index: 42},
+		ConsenterMetadata: utils.MarshalOrPanic(&cb.Metadata{Value: consensusMetadata}),
+	})
+
+	assert.Equal(t, expectedMetadataValue, md.Value, "Value contains the consensus metadata and the last config")
 	assert.NotNil(t, md.Signatures, "Should have signature")
 }
 
@@ -93,7 +110,7 @@ func TestBlockLastConfig(t *testing.T) {
 
 	md := utils.GetMetadataFromBlockOrPanic(block, cb.BlockMetadataIndex_LAST_CONFIG)
 	assert.NotNil(t, md.Value, "Value not be empty in this case")
-	assert.NotNil(t, md.Signatures, "Should have signature")
+	assert.Nil(t, md.Signatures, "Should have no signatures")
 
 	lc := utils.GetLastConfigIndexFromBlockOrPanic(block)
 	assert.Equal(t, newBlockNum, lc)
@@ -165,7 +182,9 @@ func TestWriteConfigBlock(t *testing.T) {
 }
 
 func TestGoodWriteConfig(t *testing.T) {
-	l := NewRAMLedger(10)
+	confSys := configtxgentest.Load(genesisconfig.SampleInsecureSoloProfile)
+	genesisBlockSys := encoder.New(confSys).GenesisBlock()
+	_, l := newRAMLedgerAndFactory(10, genesisconfig.TestChainID, genesisBlockSys)
 
 	bw := &BlockWriter{
 		support: &mockBlockWriterSupport{
@@ -176,7 +195,7 @@ func TestGoodWriteConfig(t *testing.T) {
 	}
 
 	ctx := makeConfigTx(genesisconfig.TestChainID, 1)
-	block := cb.NewBlock(1, genesisBlock.Header.Hash())
+	block := cb.NewBlock(1, genesisBlockSys.Header.Hash())
 	block.Data.Data = [][]byte{utils.MarshalOrPanic(ctx)}
 	consenterMetadata := []byte("foo")
 	bw.WriteConfigBlock(block, consenterMetadata)
@@ -191,4 +210,50 @@ func TestGoodWriteConfig(t *testing.T) {
 
 	omd := utils.GetMetadataFromBlockOrPanic(block, cb.BlockMetadataIndex_ORDERER)
 	assert.Equal(t, consenterMetadata, omd.Value)
+}
+
+func TestRaceWriteConfig(t *testing.T) {
+	confSys := configtxgentest.Load(genesisconfig.SampleInsecureSoloProfile)
+	genesisBlockSys := encoder.New(confSys).GenesisBlock()
+	_, l := newRAMLedgerAndFactory(10, genesisconfig.TestChainID, genesisBlockSys)
+
+	bw := &BlockWriter{
+		support: &mockBlockWriterSupport{
+			LocalSigner: mockCrypto(),
+			ReadWriter:  l,
+			Validator:   &mockconfigtx.Validator{},
+		},
+	}
+
+	ctx := makeConfigTx(genesisconfig.TestChainID, 1)
+	block1 := cb.NewBlock(1, genesisBlockSys.Header.Hash())
+	block1.Data.Data = [][]byte{utils.MarshalOrPanic(ctx)}
+	consenterMetadata1 := []byte("foo")
+
+	ctx = makeConfigTx(genesisconfig.TestChainID, 1)
+	block2 := cb.NewBlock(2, block1.Header.Hash())
+	block2.Data.Data = [][]byte{utils.MarshalOrPanic(ctx)}
+	consenterMetadata2 := []byte("bar")
+
+	bw.WriteConfigBlock(block1, consenterMetadata1)
+	bw.WriteConfigBlock(block2, consenterMetadata2)
+
+	// Wait for the commit to complete
+	bw.committingBlock.Lock()
+	bw.committingBlock.Unlock()
+
+	cBlock := blockledger.GetBlock(l, block1.Header.Number)
+	assert.Equal(t, block1.Header, cBlock.Header)
+	assert.Equal(t, block1.Data, cBlock.Data)
+	expectedLastConfigBlockNumber := block1.Header.Number
+	testLastConfigBlockNumber(t, block1, expectedLastConfigBlockNumber)
+
+	cBlock = blockledger.GetBlock(l, block2.Header.Number)
+	assert.Equal(t, block2.Header, cBlock.Header)
+	assert.Equal(t, block2.Data, cBlock.Data)
+	expectedLastConfigBlockNumber = block2.Header.Number
+	testLastConfigBlockNumber(t, block2, expectedLastConfigBlockNumber)
+
+	omd := utils.GetMetadataFromBlockOrPanic(block1, cb.BlockMetadataIndex_ORDERER)
+	assert.Equal(t, consenterMetadata1, omd.Value)
 }

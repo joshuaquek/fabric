@@ -10,31 +10,41 @@ import (
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/genesis"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/configtxgentest"
 	"github.com/hyperledger/fabric/common/tools/configtxgen/encoder"
 	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/core/ledger/util"
 	cb "github.com/hyperledger/fabric/protos/common"
 	mspproto "github.com/hyperledger/fabric/protos/msp"
+	"github.com/hyperledger/fabric/protos/peer"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
 )
 
-var logger = flogging.MustGetLogger("common/configtx/test")
+var logger = flogging.MustGetLogger("common.configtx.test")
 
 // MakeGenesisBlock creates a genesis block using the test templates for the given chainID
 func MakeGenesisBlock(chainID string) (*cb.Block, error) {
-	profile := genesisconfig.Load(genesisconfig.SampleDevModeSoloProfile)
+	profile := configtxgentest.Load(genesisconfig.SampleDevModeSoloProfile)
 	channelGroup, err := encoder.NewChannelGroup(profile)
 	if err != nil {
 		logger.Panicf("Error creating channel config: %s", err)
 	}
 
-	return genesis.NewFactoryImpl(channelGroup).Block(chainID)
+	gb := genesis.NewFactoryImpl(channelGroup).Block(chainID)
+	if gb == nil {
+		return gb, nil
+	}
+
+	txsFilter := util.NewTxValidationFlagsSetValue(len(gb.Data.Data), peer.TxValidationCode_VALID)
+	gb.Metadata.Metadata[cb.BlockMetadataIndex_TRANSACTIONS_FILTER] = txsFilter
+
+	return gb, nil
 }
 
 // MakeGenesisBlockWithMSPs creates a genesis block using the MSPs provided for the given chainID
-func MakeGenesisBlockFromMSPs(chainID string, appMSPConf, ordererMSPConf *mspproto.MSPConfig,
-	appOrgID, ordererOrgID string) (*cb.Block, error) {
-	profile := genesisconfig.Load(genesisconfig.SampleDevModeSoloProfile)
+func MakeGenesisBlockFromMSPs(chainID string, appMSPConf, ordererMSPConf *mspproto.MSPConfig, appOrgID, ordererOrgID string) (*cb.Block, error) {
+	profile := configtxgentest.Load(genesisconfig.SampleDevModeSoloProfile)
 	profile.Orderer.Organizations = nil
 	channelGroup, err := encoder.NewChannelGroup(profile)
 	if err != nil {
@@ -62,5 +72,5 @@ func MakeGenesisBlockFromMSPs(chainID string, appMSPConf, ordererMSPConf *msppro
 	channelGroup.Groups[channelconfig.OrdererGroupKey].Groups[ordererOrgID] = ordererOrg
 	channelGroup.Groups[channelconfig.ApplicationGroupKey].Groups[appOrgID] = applicationOrg
 
-	return genesis.NewFactoryImpl(channelGroup).Block(chainID)
+	return genesis.NewFactoryImpl(channelGroup).Block(chainID), nil
 }

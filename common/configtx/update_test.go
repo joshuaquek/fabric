@@ -12,7 +12,6 @@ import (
 
 	mockpolicies "github.com/hyperledger/fabric/common/mocks/policies"
 	cb "github.com/hyperledger/fabric/protos/common"
-
 	"github.com/stretchr/testify/assert"
 )
 
@@ -128,7 +127,7 @@ func TestPolicyForItem(t *testing.T) {
 		pm: &mockpolicies.Manager{
 			Policy: rootPolicy,
 			SubManagersMap: map[string]*mockpolicies.Manager{
-				"foo": &mockpolicies.Manager{
+				"foo": {
 					Policy: fooPolicy,
 				},
 			},

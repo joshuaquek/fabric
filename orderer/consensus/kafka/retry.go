@@ -48,7 +48,7 @@ func (rp *retryProcess) try(interval, total time.Duration) (err error) {
 	// (which would result in panic). The path below is for those test cases
 	// when we cannot avoid the creation of a retriable process but we wish
 	// to terminate it right away.
-	if rp.shortPollingInterval == 0*time.Second {
+	if rp.shortPollingInterval == 0 {
 		return fmt.Errorf("illegal value")
 	}
 
@@ -70,9 +70,8 @@ func (rp *retryProcess) try(interval, total time.Duration) (err error) {
 	for {
 		select {
 		case <-rp.exit:
-			exitErr := fmt.Errorf("[channel: %s] process asked to exit", rp.channel.topic())
-			logger.Warning(exitErr.Error()) // Log it at the warning level
-			return exitErr
+			logger.Warningf("[channel: %s] process asked to exit", rp.channel.topic())
+			return fmt.Errorf("process asked to exit")
 		case <-tickTotal.C:
 			return
 		case <-tickInterval.C:

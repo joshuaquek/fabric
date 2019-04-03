@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 package csp_test
 
@@ -65,6 +55,27 @@ func TestLoadPrivateKey(t *testing.T) {
 	loadedPriv, _, _ := csp.LoadPrivateKey(testDir)
 	assert.NotNil(t, loadedPriv, "Should have returned a bccsp.Key")
 	assert.Equal(t, priv.SKI(), loadedPriv.SKI(), "Should have same subject identifier")
+	cleanup(testDir)
+}
+
+func TestLoadPrivateKey_wrongEncoding(t *testing.T) {
+	if err := os.Mkdir(testDir, 0755); err != nil {
+		panic("failed to create dir " + testDir + ":" + err.Error())
+	}
+	filename := testDir + "/wrong_encoding_sk"
+	file, err := os.Create(filename)
+	if err != nil {
+		panic("failed to create tmpfile " + filename + ":" + err.Error())
+	}
+	defer file.Close()
+	_, err = file.Write([]byte("wrong_encoding"))
+	if err != nil {
+		panic("failed to write to " + filename + ":" + err.Error())
+	}
+	file.Close() // To flush test file content
+	_, _, err = csp.LoadPrivateKey(testDir)
+	assert.NotNil(t, err)
+	assert.EqualError(t, err, testDir+"/wrong_encoding_sk: wrong PEM encoding")
 	cleanup(testDir)
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/gossip"
+	"github.com/hyperledger/fabric/gossip/metrics"
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -52,6 +53,7 @@ func newConfig(selfEndpoint string, externalEndpoint string, certs *common.TLSCe
 		PublishStateInfoInterval:   util.GetDurationOrDefault("peer.gossip.publishStateInfoInterval", 4*time.Second),
 		SkipBlockVerification:      viper.GetBool("peer.gossip.skipBlockVerification"),
 		TLSCerts:                   certs,
+		TimeForMembershipTracker:   util.GetDurationOrDefault("peer.gossip.membershipTrackerInterval", 5*time.Second),
 	}
 
 	return conf, nil
@@ -60,7 +62,8 @@ func newConfig(selfEndpoint string, externalEndpoint string, certs *common.TLSCe
 // NewGossipComponent creates a gossip component that attaches itself to the given gRPC server
 func NewGossipComponent(peerIdentity []byte, endpoint string, s *grpc.Server,
 	secAdv api.SecurityAdvisor, cryptSvc api.MessageCryptoService,
-	secureDialOpts api.PeerSecureDialOpts, certs *common.TLSCertificates, bootPeers ...string) (gossip.Gossip, error) {
+	secureDialOpts api.PeerSecureDialOpts, certs *common.TLSCertificates, gossipMetrics *metrics.GossipMetrics,
+	bootPeers ...string) (gossip.Gossip, error) {
 
 	externalEndpoint := viper.GetString("peer.gossip.externalEndpoint")
 
@@ -69,7 +72,7 @@ func NewGossipComponent(peerIdentity []byte, endpoint string, s *grpc.Server,
 		return nil, errors.WithStack(err)
 	}
 	gossipInstance := gossip.NewGossipService(conf, s, secAdv, cryptSvc,
-		peerIdentity, secureDialOpts)
+		peerIdentity, secureDialOpts, gossipMetrics)
 
 	return gossipInstance, nil
 }

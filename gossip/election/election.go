@@ -8,12 +8,12 @@ package election
 
 import (
 	"bytes"
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/fabric/gossip/util"
-	"github.com/op/go-logging"
 	"github.com/spf13/viper"
 )
 
@@ -82,6 +82,9 @@ type LeaderElectionAdapter interface {
 
 	// Peers returns a list of peers considered alive
 	Peers() []Peer
+
+	// ReportMetrics sends a report to the metrics server about a leadership status
+	ReportMetrics(isLeader bool)
 }
 
 type leadershipCallback func(isLeader bool)
@@ -100,6 +103,13 @@ type LeaderElectionService interface {
 }
 
 type peerID []byte
+
+func (p peerID) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return hex.EncodeToString(p)
+}
 
 // Peer describes a remote peer
 type Peer interface {
@@ -131,7 +141,7 @@ func NewLeaderElectionService(adapter LeaderElectionAdapter, id string, callback
 		adapter:       adapter,
 		stopChan:      make(chan struct{}, 1),
 		interruptChan: make(chan struct{}, 1),
-		logger:        util.GetLogger(util.LoggingElectionModule, ""),
+		logger:        util.GetLogger(util.ElectionLogger, ""),
 		callback:      noopCallback,
 	}
 
@@ -157,7 +167,7 @@ type leaderElectionSvcImpl struct {
 	yield         int32
 	sleeping      bool
 	adapter       LeaderElectionAdapter
-	logger        *logging.Logger
+	logger        util.Logger
 	callback      leadershipCallback
 	yieldTimer    *time.Timer
 }
@@ -312,6 +322,7 @@ func (le *leaderElectionSvcImpl) follower() {
 
 	le.proposals.Clear()
 	atomic.StoreInt32(&le.leaderExists, int32(0))
+	le.adapter.ReportMetrics(false)
 	select {
 	case <-time.After(getLeaderAliveThreshold()):
 	case <-le.stopChan:
@@ -322,6 +333,7 @@ func (le *leaderElectionSvcImpl) follower() {
 func (le *leaderElectionSvcImpl) leader() {
 	leaderDeclaration := le.adapter.CreateMessage(true)
 	le.adapter.Gossip(leaderDeclaration)
+	le.adapter.ReportMetrics(true)
 	le.waitForInterrupt(getLeadershipDeclarationInterval())
 }
 

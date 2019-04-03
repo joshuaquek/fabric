@@ -17,12 +17,11 @@ limitations under the License.
 package cauthdsl
 
 import (
-	cb "github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/msp"
-
 	"sort"
 
 	"github.com/golang/protobuf/proto"
+	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/protos/msp"
 	"github.com/hyperledger/fabric/protos/utils"
 )
 
@@ -93,12 +92,6 @@ func SignedByMspClient(mspId string) *cb.SignaturePolicyEnvelope {
 // requiring 1 signature from any peer of the specified MSP
 func SignedByMspPeer(mspId string) *cb.SignaturePolicyEnvelope {
 	return signedByFabricEntity(mspId, msp.MSPRole_PEER)
-}
-
-// SignedByMspOrderer creates a SignaturePolicyEnvelope
-// requiring 1 signature from any orderer of the specified MSP
-func SignedByMspOrderer(mspId string) *cb.SignaturePolicyEnvelope {
-	return signedByFabricEntity(mspId, msp.MSPRole_ORDERER)
 }
 
 // SignedByFabricEntity creates a SignaturePolicyEnvelope
@@ -173,13 +166,6 @@ func SignedByAnyMember(ids []string) *cb.SignaturePolicyEnvelope {
 // listed in the supplied string array
 func SignedByAnyClient(ids []string) *cb.SignaturePolicyEnvelope {
 	return signedByAnyOfGivenRole(msp.MSPRole_CLIENT, ids)
-}
-
-// SignedByAnyOrderer returns a policy that requires one valid
-// signature from an orderer of any of the orgs whose ids are
-// listed in the supplied string array
-func SignedByAnyOrderer(ids []string) *cb.SignaturePolicyEnvelope {
-	return signedByAnyOfGivenRole(msp.MSPRole_ORDERER, ids)
 }
 
 // SignedByAnyPeer returns a policy that requires one valid

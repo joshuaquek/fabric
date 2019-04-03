@@ -18,7 +18,6 @@ import (
 // and authenticate remote peers and data they send, as well as to verify
 // received blocks from the ordering service.
 type MessageCryptoService interface {
-
 	// GetPKIidOfCert returns the PKI-ID of a peer's identity
 	// If any error occurs, the method return nil
 	// This method does not validate peerIdentity.
@@ -58,6 +57,51 @@ type MessageCryptoService interface {
 	// - A zero value, error in case it cannot be
 	//   determined if the identity can expire or not
 	Expiration(peerIdentity PeerIdentityType) (time.Time, error)
+}
+
+// PeerIdentityInfo aggregates a peer's identity,
+// and also additional metadata about it
+type PeerIdentityInfo struct {
+	PKIId        common.PKIidType
+	Identity     PeerIdentityType
+	Organization OrgIdentityType
+}
+
+// PeerIdentitySet aggregates a PeerIdentityInfo slice
+type PeerIdentitySet []PeerIdentityInfo
+
+// PeerIdentityFilter defines predicate function used to filter
+// peer identities
+type PeerIdentityFilter func(info PeerIdentityInfo) bool
+
+// ByOrg sorts the PeerIdentitySet by organizations of its peers
+func (pis PeerIdentitySet) ByOrg() map[string]PeerIdentitySet {
+	m := make(map[string]PeerIdentitySet)
+	for _, id := range pis {
+		m[string(id.Organization)] = append(m[string(id.Organization)], id)
+	}
+	return m
+}
+
+// ByOrg sorts the PeerIdentitySet by PKI-IDs of its peers
+func (pis PeerIdentitySet) ByID() map[string]PeerIdentityInfo {
+	m := make(map[string]PeerIdentityInfo)
+	for _, id := range pis {
+		m[string(id.PKIId)] = id
+	}
+	return m
+}
+
+// Filter filters identities based on predicate, returns new  PeerIdentitySet
+// with filtered ids.
+func (pis PeerIdentitySet) Filter(filter PeerIdentityFilter) PeerIdentitySet {
+	var result PeerIdentitySet
+	for _, id := range pis {
+		if filter(id) {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 // PeerIdentityType is the peer's certificate

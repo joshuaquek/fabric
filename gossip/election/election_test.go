@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/core/config"
+	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -123,6 +123,10 @@ func (p *peer) Peers() []Peer {
 	return peers
 }
 
+func (p *peer) ReportMetrics(isLeader bool) {
+	p.Mock.Called(isLeader)
+}
+
 func (p *peer) leaderCallback(isLeader bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -156,16 +160,21 @@ func createPeers(spawnInterval time.Duration, ids ...int) []*peer {
 	return peers
 }
 
-func createPeer(id int, peerMap map[string]*peer, l *sync.RWMutex) *peer {
+func createPeerWithCostumeMetrics(id int, peerMap map[string]*peer, l *sync.RWMutex, f func(mock.Arguments)) *peer {
 	idStr := fmt.Sprintf("p%d", id)
 	c := make(chan Msg, 100)
 	p := &peer{id: idStr, peers: peerMap, sharedLock: l, msgChan: c, mockedMethods: make(map[string]struct{}), leaderFromCallback: false, callbackInvoked: false}
+	p.On("ReportMetrics", mock.Anything).Run(f)
 	p.LeaderElectionService = NewLeaderElectionService(p, idStr, p.leaderCallback)
 	l.Lock()
 	peerMap[idStr] = p
 	l.Unlock()
 	return p
 
+}
+
+func createPeer(id int, peerMap map[string]*peer, l *sync.RWMutex) *peer {
+	return createPeerWithCostumeMetrics(id, peerMap, l, func(mock.Arguments) {})
 }
 
 func waitForMultipleLeadersElection(t *testing.T, peers []*peer, leadersNum int) []string {
@@ -190,6 +199,45 @@ func waitForLeaderElection(t *testing.T, peers []*peer) []string {
 	return waitForMultipleLeadersElection(t, peers, 1)
 }
 
+func TestMetrics(t *testing.T) {
+	t.Parallel()
+	// Scenario: spawn a single peer and ensure it reports being a leader after some time.
+	// Then, make it relinquish its leadership and then ensure it reports not being a leader.
+	var wgLeader sync.WaitGroup
+	var wgFollower sync.WaitGroup
+	wgLeader.Add(1)
+	wgFollower.Add(1)
+	var once sync.Once
+	var once2 sync.Once
+	f := func(args mock.Arguments) {
+		if args[0] == true {
+			once.Do(func() {
+				wgLeader.Done()
+			})
+		} else {
+			once2.Do(func() {
+				wgFollower.Done()
+			})
+		}
+	}
+
+	p := createPeerWithCostumeMetrics(0, make(map[string]*peer), &sync.RWMutex{}, f)
+	waitForLeaderElection(t, []*peer{p})
+
+	// Ensure we sent a leadership declaration during the time of leadership acquisition
+	wgLeader.Wait()
+	p.AssertCalled(t, "ReportMetrics", true)
+
+	p.Yield()
+	assert.False(t, p.IsLeader())
+
+	// Ensure declaration for not being a leader was sent
+	wgFollower.Wait()
+	p.AssertCalled(t, "ReportMetrics", false)
+
+	waitForLeaderElection(t, []*peer{p})
+}
+
 func TestInitPeersAtSameTime(t *testing.T) {
 	t.Parallel()
 	// Scenario: Peers are spawned at the same time
@@ -206,7 +254,7 @@ func TestInitPeersAtSameTime(t *testing.T) {
 func TestInitPeersStartAtIntervals(t *testing.T) {
 	t.Parallel()
 	// Scenario: Peers are spawned one by one in a slow rate
-	// expected outcome: the first peer is the leader although its ID is lowest
+	// expected outcome: the first peer is the leader although its ID is highest
 	peers := createPeers(getStartupGracePeriod()+getLeadershipDeclarationInterval(), 3, 2, 1, 0)
 	waitForLeaderElection(t, peers)
 	assert.True(t, peers[0].IsLeader())
@@ -414,7 +462,20 @@ func TestPartition(t *testing.T) {
 			waitForBoolFunc(t, p.isCallbackInvoked, true, "Leadership callback wasn't invoked for %s", p.id)
 		}
 	}
+}
 
+func Test_peerIDString(t *testing.T) {
+	tests := []struct {
+		input    peerID
+		expected string
+	}{
+		{nil, "<nil>"},
+		{peerID{}, ""},
+		{peerID{0, 1, 2, 3}, "00010203"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.expected, tt.input.String())
+	}
 }
 
 func TestConfigFromFile(t *testing.T) {
@@ -443,7 +504,7 @@ func TestConfigFromFile(t *testing.T) {
 	viper.Reset()
 	viper.SetConfigName("core")
 	viper.SetEnvPrefix("CORE")
-	config.AddDevConfigPath(nil)
+	configtest.AddDevConfigPath(nil)
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 	err := viper.ReadInConfig()

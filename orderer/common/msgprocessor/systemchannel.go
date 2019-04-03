@@ -9,6 +9,7 @@ package msgprocessor
 import (
 	"fmt"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/crypto"
@@ -16,7 +17,7 @@ import (
 	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protos/utils"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 // ChannelConfigTemplator can be used to generate config templates.
@@ -48,6 +49,7 @@ func CreateSystemChannelFilters(chainCreator ChainCreator, ledgerResources chann
 	}
 	return NewRuleSet([]Rule{
 		EmptyRejectRule,
+		NewExpirationRejectRule(ledgerResources),
 		NewSizeFilter(ordererConfig),
 		NewSigFilter(policies.ChannelWriters, ledgerResources),
 		NewSystemChannelFilter(ledgerResources, chainCreator),
@@ -101,7 +103,7 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 
 	newChannelConfigEnv, err := bundle.ConfigtxValidator().ProposeConfigUpdate(envConfigUpdate)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, errors.WithMessage(err, fmt.Sprintf("error validating channel creation transaction for new channel '%s', could not succesfully apply update to template configuration", channelID))
 	}
 
 	newChannelEnvConfig, err := utils.CreateSignedEnvelope(cb.HeaderType_CONFIG, channelID, s.support.Signer(), newChannelConfigEnv, msgVersion, epoch)
@@ -293,7 +295,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 			if !ok {
 				return nil, fmt.Errorf("Attempted to include a member which is not in the consortium")
 			}
-			applicationGroup.Groups[orgName] = consortiumGroup
+			applicationGroup.Groups[orgName] = proto.Clone(consortiumGroup).(*cb.ConfigGroup)
 		}
 	}
 
@@ -301,7 +303,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 
 	// Copy the system channel Channel level config to the new config
 	for key, value := range systemChannelGroup.Values {
-		channelGroup.Values[key] = value
+		channelGroup.Values[key] = proto.Clone(value).(*cb.ConfigValue)
 		if key == channelconfig.ConsortiumKey {
 			// Do not set the consortium name, we do this later
 			continue
@@ -309,11 +311,11 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 	}
 
 	for key, policy := range systemChannelGroup.Policies {
-		channelGroup.Policies[key] = policy
+		channelGroup.Policies[key] = proto.Clone(policy).(*cb.ConfigPolicy)
 	}
 
 	// Set the new config orderer group to the system channel orderer group and the application group to the new application group
-	channelGroup.Groups[channelconfig.OrdererGroupKey] = systemChannelGroup.Groups[channelconfig.OrdererGroupKey]
+	channelGroup.Groups[channelconfig.OrdererGroupKey] = proto.Clone(systemChannelGroup.Groups[channelconfig.OrdererGroupKey]).(*cb.ConfigGroup)
 	channelGroup.Groups[channelconfig.ApplicationGroupKey] = applicationGroup
 	channelGroup.Values[channelconfig.ConsortiumKey] = &cb.ConfigValue{
 		Value:     utils.MarshalOrPanic(channelconfig.ConsortiumValue(consortium.Name).Value()),
@@ -322,8 +324,9 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 
 	// Non-backwards compatible bugfix introduced in v1.1
 	// The capability check should be removed once v1.0 is deprecated
-	if oc, ok := dt.support.OrdererConfig(); ok && oc.Capabilities().SetChannelModPolicyDuringCreate() {
+	if oc, ok := dt.support.OrdererConfig(); ok && oc.Capabilities().PredictableChannelTemplate() {
 		channelGroup.ModPolicy = systemChannelGroup.ModPolicy
+		zeroVersions(channelGroup)
 	}
 
 	bundle, err := channelconfig.NewBundle(channelHeader.ChannelId, &cb.Config{
@@ -335,4 +338,21 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 	}
 
 	return bundle, nil
+}
+
+// zeroVersions recursively iterates over a config tree, setting all versions to zero
+func zeroVersions(cg *cb.ConfigGroup) {
+	cg.Version = 0
+
+	for _, value := range cg.Values {
+		value.Version = 0
+	}
+
+	for _, policy := range cg.Policies {
+		policy.Version = 0
+	}
+
+	for _, group := range cg.Groups {
+		zeroVersions(group)
+	}
 }

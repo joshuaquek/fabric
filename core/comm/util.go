@@ -8,13 +8,13 @@ package comm
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/common/util"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 )
@@ -112,8 +112,21 @@ func noopBinding(_ context.Context, _ []byte) error {
 	return nil
 }
 
-// ExtractCertificateHashFromContext extracts the hash of the certificate from the given context
+// ExtractCertificateHashFromContext extracts the hash of the certificate from the given context.
+// If the certificate isn't present, nil is returned
 func ExtractCertificateHashFromContext(ctx context.Context) []byte {
+	rawCert := ExtractRawCertificateFromContext(ctx)
+	if len(rawCert) == 0 {
+		return nil
+	}
+	h := sha256.New()
+	h.Write(rawCert)
+	return h.Sum(nil)
+}
+
+// ExtractCertificateFromContext returns the TLS certificate (if applicable)
+// from the given context of a gRPC stream
+func ExtractCertificateFromContext(ctx context.Context) *x509.Certificate {
 	pr, extracted := peer.FromContext(ctx)
 	if !extracted {
 		return nil
@@ -132,9 +145,15 @@ func ExtractCertificateHashFromContext(ctx context.Context) []byte {
 	if len(certs) == 0 {
 		return nil
 	}
-	raw := certs[0].Raw
-	if len(raw) == 0 {
+	return certs[0]
+}
+
+// ExtractRawCertificateFromContext returns the raw TLS certificate (if applicable)
+// from the given context of a gRPC stream
+func ExtractRawCertificateFromContext(ctx context.Context) []byte {
+	cert := ExtractCertificateFromContext(ctx)
+	if cert == nil {
 		return nil
 	}
-	return util.ComputeSHA256(raw)
+	return cert.Raw
 }

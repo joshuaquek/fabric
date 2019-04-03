@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	cb "github.com/hyperledger/fabric/protos/common"
-
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,6 +36,22 @@ func TestNoUpdate(t *testing.T) {
 	})
 
 	assert.Error(t, err)
+}
+
+func TestMissingGroup(t *testing.T) {
+	group := &cb.ConfigGroup{}
+	t.Run("MissingOriginal", func(t *testing.T) {
+		_, err := Compute(&cb.Config{}, &cb.Config{ChannelGroup: group})
+
+		assert.Error(t, err)
+		assert.Regexp(t, "no channel group included for original config", err.Error())
+	})
+	t.Run("MissingOriginal", func(t *testing.T) {
+		_, err := Compute(&cb.Config{ChannelGroup: group}, &cb.Config{})
+
+		assert.Error(t, err)
+		assert.Regexp(t, "no channel group included for updated config", err.Error())
+	})
 }
 
 func TestGroupModPolicyUpdate(t *testing.T) {

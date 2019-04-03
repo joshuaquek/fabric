@@ -10,10 +10,9 @@ import (
 	"bytes"
 	"fmt"
 
-	cb "github.com/hyperledger/fabric/protos/common"
-
 	"github.com/golang/protobuf/proto"
-	"github.com/op/go-logging"
+	cb "github.com/hyperledger/fabric/protos/common"
+	"go.uber.org/zap/zapcore"
 )
 
 type implicitMetaPolicy struct {
@@ -72,12 +71,12 @@ func (imp *implicitMetaPolicy) Evaluate(signatureSet []*cb.SignedData) error {
 	defer func() {
 		if remaining != 0 {
 			// This log message may be large and expensive to construct, so worth checking the log level
-			if logger.IsEnabledFor(logging.DEBUG) {
+			if logger.IsEnabledFor(zapcore.DebugLevel) {
 				var b bytes.Buffer
 				b.WriteString(fmt.Sprintf("Evaluation Failed: Only %d policies were satisfied, but needed %d of [ ", imp.threshold-remaining, imp.threshold))
 				for m := range imp.managers {
 					b.WriteString(m)
-					b.WriteString(".")
+					b.WriteString("/")
 					b.WriteString(imp.subPolicyName)
 					b.WriteString(" ")
 				}
@@ -98,5 +97,5 @@ func (imp *implicitMetaPolicy) Evaluate(signatureSet []*cb.SignedData) error {
 	if remaining == 0 {
 		return nil
 	}
-	return fmt.Errorf("Failed to reach implicit threshold of %d sub-policies, required %d remaining", imp.threshold, remaining)
+	return fmt.Errorf("implicit policy evaluation failed - %d sub-policies were satisfied, but this policy requires %d of the '%s' sub-policies to be satisfied", (imp.threshold - remaining), imp.threshold, imp.subPolicyName)
 }

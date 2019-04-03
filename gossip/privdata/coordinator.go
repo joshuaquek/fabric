@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	vsccErrors "github.com/hyperledger/fabric/common/errors"
 	util2 "github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/committer"
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
@@ -20,14 +21,15 @@ import (
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/transientstore"
+	"github.com/hyperledger/fabric/gossip/metrics"
+	privdatacommon "github.com/hyperledger/fabric/gossip/privdata/common"
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/hyperledger/fabric/protos/common"
-	gossip2 "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/hyperledger/fabric/protos/ledger/rwset"
-	msp "github.com/hyperledger/fabric/protos/msp"
+	"github.com/hyperledger/fabric/protos/msp"
 	"github.com/hyperledger/fabric/protos/peer"
+	transientstore2 "github.com/hyperledger/fabric/protos/transientstore"
 	"github.com/hyperledger/fabric/protos/utils"
-	"github.com/op/go-logging"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 )
@@ -38,14 +40,17 @@ const (
 	transientBlockRetentionDefault   = 1000
 )
 
-var logger *logging.Logger // package-level logger
+var logger = util.GetLogger(util.PrivateDataLogger, "")
 
-func init() {
-	logger = util.GetLogger(util.LoggingPrivModule, "")
-}
+//go:generate mockery -dir ../../core/common/privdata/ -name CollectionStore -case underscore -output mocks/
+//go:generate mockery -dir ../../core/committer/ -name Committer -case underscore -output mocks/
 
 // TransientStore holds private data that the corresponding blocks haven't been committed yet into the ledger
 type TransientStore interface {
+	// PersistWithConfig stores the private write set of a transaction along with the collection config
+	// in the transient store based on txid and the block height the private data was received at
+	PersistWithConfig(txid string, blockHeight uint64, privateSimulationResultsWithConfig *transientstore2.TxPvtReadWriteSetWithConfigInfo) error
+
 	// Persist stores the private write set of a transaction in the transient store
 	Persist(txid string, blockHeight uint64, privateSimulationResults *rwset.TxPvtReadWriteSet) error
 	// GetTxPvtRWSetByTxid returns an iterator due to the fact that the txid may have multiple private
@@ -74,7 +79,7 @@ type Coordinator interface {
 	StoreBlock(block *common.Block, data util.PvtDataCollections) error
 
 	// StorePvtData used to persist private data into transient store
-	StorePvtData(txid string, privData *rwset.TxPvtReadWriteSet) error
+	StorePvtData(txid string, privData *transientstore2.TxPvtReadWriteSetWithConfigInfo, blckHeight uint64) error
 
 	// GetPvtDataAndBlockByNum get block by number and returns also all related private data
 	// the order of private data in slice of PvtDataCollections doesn't implies the order of
@@ -89,10 +94,10 @@ type Coordinator interface {
 	Close()
 }
 
-type dig2sources map[*gossip2.PvtDataDigest][]*peer.Endorsement
+type dig2sources map[privdatacommon.DigKey][]*peer.Endorsement
 
-func (d2s dig2sources) keys() []*gossip2.PvtDataDigest {
-	var res []*gossip2.PvtDataDigest
+func (d2s dig2sources) keys() []privdatacommon.DigKey {
+	res := make([]privdatacommon.DigKey, 0, len(d2s))
 	for dig := range d2s {
 		res = append(res, dig)
 	}
@@ -102,12 +107,13 @@ func (d2s dig2sources) keys() []*gossip2.PvtDataDigest {
 // Fetcher interface which defines API to fetch missing
 // private data elements
 type Fetcher interface {
-	fetch(dig2src dig2sources) ([]*gossip2.PvtDataElement, error)
+	fetch(dig2src dig2sources) (*privdatacommon.FetchedPvtDataContainer, error)
 }
 
 // Support encapsulates set of interfaces to
 // aggregate required functionality by single struct
 type Support struct {
+	ChainID string
 	privdata.CollectionStore
 	txvalidator.Validator
 	committer.Committer
@@ -119,25 +125,23 @@ type coordinator struct {
 	selfSignedData common.SignedData
 	Support
 	transientBlockRetention uint64
+	metrics                 *metrics.PrivdataMetrics
 }
 
 // NewCoordinator creates a new instance of coordinator
-func NewCoordinator(support Support, selfSignedData common.SignedData) Coordinator {
+func NewCoordinator(support Support, selfSignedData common.SignedData, metrics *metrics.PrivdataMetrics) Coordinator {
 	transientBlockRetention := uint64(viper.GetInt(transientBlockRetentionConfigKey))
 	if transientBlockRetention == 0 {
 		logger.Warning("Configuration key", transientBlockRetentionConfigKey, "isn't set, defaulting to", transientBlockRetentionDefault)
 		transientBlockRetention = transientBlockRetentionDefault
 	}
-	return &coordinator{Support: support, selfSignedData: selfSignedData, transientBlockRetention: transientBlockRetention}
+	return &coordinator{Support: support, selfSignedData: selfSignedData,
+		transientBlockRetention: transientBlockRetention, metrics: metrics}
 }
 
 // StorePvtData used to persist private date into transient store
-func (c *coordinator) StorePvtData(txID string, privData *rwset.TxPvtReadWriteSet) error {
-	height, err := c.Support.LedgerHeight()
-	if err != nil {
-		return errors.Wrap(err, "failed obtaining ledger height, thus cannot persist private data")
-	}
-	return c.TransientStore.Persist(txID, height, privData)
+func (c *coordinator) StorePvtData(txID string, privData *transientstore2.TxPvtReadWriteSetWithConfigInfo, blkHeight uint64) error {
+	return c.TransientStore.PersistWithConfig(txID, blkHeight, privData)
 }
 
 // StoreBlock stores block with private data into the ledger
@@ -148,19 +152,26 @@ func (c *coordinator) StoreBlock(block *common.Block, privateDataSets util.PvtDa
 	if block.Header == nil {
 		return errors.New("Block header is nil")
 	}
-	logger.Infof("Received block [%d]", block.Header.Number)
 
-	logger.Debugf("Validating block [%d]", block.Header.Number)
+	logger.Infof("[%s] Received block [%d] from buffer", c.ChainID, block.Header.Number)
+
+	logger.Debugf("[%s] Validating block [%d]", c.ChainID, block.Header.Number)
+
+	validationStart := time.Now()
 	err := c.Validator.Validate(block)
+	c.reportValidationDuration(time.Since(validationStart))
 	if err != nil {
-		return errors.WithMessage(err, "Validation failed")
+		logger.Errorf("Validation failed: %+v", err)
+		return err
 	}
 
 	blockAndPvtData := &ledger.BlockAndPvtData{
-		Block:        block,
-		BlockPvtData: make(map[uint64]*ledger.TxPvtData),
+		Block:          block,
+		PvtData:        make(ledger.TxPvtDataMap),
+		MissingPvtData: make(ledger.TxMissingPvtDataMap),
 	}
 
+	listMissingStart := time.Now()
 	ownedRWsets, err := computeOwnedRWsets(block, privateDataSets)
 	if err != nil {
 		logger.Warning("Failed computing owned RWSets", err)
@@ -173,36 +184,47 @@ func (c *coordinator) StoreBlock(block *common.Block, privateDataSets util.PvtDa
 		return err
 	}
 
+	c.reportListMissingPrivateDataDuration(time.Since(listMissingStart))
+
 	retryThresh := viper.GetDuration("peer.gossip.pvtData.pullRetryThreshold")
 	var bFetchFromPeers bool // defaults to false
 	if len(privateInfo.missingKeys) == 0 {
-		logger.Debug("No missing collection private write sets to fetch from remote peers")
+		logger.Debugf("[%s] No missing collection private write sets to fetch from remote peers", c.ChainID)
 	} else {
 		bFetchFromPeers = true
-		logger.Debug("Could not find all collection private write sets in local peer transient store.")
-		logger.Debug("Fetching", len(privateInfo.missingKeys), "collection private write sets from remote peers for a maximum duration of", retryThresh)
+		logger.Debugf("[%s] Could not find all collection private write sets in local peer transient store for block [%d].", c.ChainID, block.Header.Number)
+		logger.Debugf("[%s] Fetching %d collection private write sets from remote peers for a maximum duration of %s", c.ChainID, len(privateInfo.missingKeys), retryThresh)
 	}
-	start := time.Now()
-	limit := start.Add(retryThresh)
+	startPull := time.Now()
+	limit := startPull.Add(retryThresh)
 	for len(privateInfo.missingKeys) > 0 && time.Now().Before(limit) {
 		c.fetchFromPeers(block.Header.Number, ownedRWsets, privateInfo)
+		// If succeeded to fetch everything, no need to sleep before
+		// retry
+		if len(privateInfo.missingKeys) == 0 {
+			break
+		}
 		time.Sleep(pullRetrySleepInterval)
 	}
+	elapsedPull := int64(time.Since(startPull) / time.Millisecond) // duration in ms
+
+	c.reportFetchDuration(time.Since(startPull))
 
 	// Only log results if we actually attempted to fetch
 	if bFetchFromPeers {
 		if len(privateInfo.missingKeys) == 0 {
-			logger.Debug("Fetched all missing collection private write sets from remote peers")
+			logger.Infof("[%s] Fetched all missing collection private write sets from remote peers for block [%d] (%dms)", c.ChainID, block.Header.Number, elapsedPull)
 		} else {
-			logger.Warning("Could not fetch all missing collection private write sets from remote peers. Will commit block with missing private write sets:", privateInfo.missingKeys)
+			logger.Warningf("[%s] Could not fetch all missing collection private write sets from remote peers. Will commit block [%d] with missing private write sets:[%v]",
+				c.ChainID, block.Header.Number, privateInfo.missingKeys)
 		}
 	}
 
 	// populate the private RWSets passed to the ledger
 	for seqInBlock, nsRWS := range ownedRWsets.bySeqsInBlock() {
 		rwsets := nsRWS.toRWSet()
-		logger.Debugf("Added %d namespace private write sets for block [%d], tran [%d]", len(rwsets.NsPvtRwset), block.Header.Number, seqInBlock)
-		blockAndPvtData.BlockPvtData[seqInBlock] = &ledger.TxPvtData{
+		logger.Debugf("[%s] Added %d namespace private write sets for block [%d], tran [%d]", c.ChainID, len(rwsets.NsPvtRwset), block.Header.Number, seqInBlock)
+		blockAndPvtData.PvtData[seqInBlock] = &ledger.TxPvtData{
 			SeqInBlock: seqInBlock,
 			WriteSet:   rwsets,
 		}
@@ -210,21 +232,25 @@ func (c *coordinator) StoreBlock(block *common.Block, privateDataSets util.PvtDa
 
 	// populate missing RWSets to be passed to the ledger
 	for missingRWS := range privateInfo.missingKeys {
-		blockAndPvtData.Missing = append(blockAndPvtData.Missing, ledger.MissingPrivateData{
-			TxId:       missingRWS.txID,
-			Namespace:  missingRWS.namespace,
-			Collection: missingRWS.collection,
-			SeqInBlock: int(missingRWS.seqInBlock),
-		})
+		blockAndPvtData.MissingPvtData.Add(missingRWS.seqInBlock, missingRWS.namespace, missingRWS.collection, true)
+	}
+
+	// populate missing RWSets for ineligible collections to be passed to the ledger
+	for _, missingRWS := range privateInfo.missingRWSButIneligible {
+		blockAndPvtData.MissingPvtData.Add(missingRWS.seqInBlock, missingRWS.namespace, missingRWS.collection, false)
 	}
 
 	// commit block and private data
+	commitStart := time.Now()
 	err = c.CommitWithPvtData(blockAndPvtData)
+	c.reportCommitDuration(time.Since(commitStart))
 	if err != nil {
 		return errors.Wrap(err, "commit failed")
 	}
 
-	if len(blockAndPvtData.BlockPvtData) > 0 {
+	purgeStart := time.Now()
+
+	if len(blockAndPvtData.PvtData) > 0 {
 		// Finally, purge all transactions in block - valid or not valid.
 		if err := c.PurgeByTxids(privateInfo.txns); err != nil {
 			logger.Error("Purging transactions", privateInfo.txns, "failed:", err)
@@ -239,14 +265,16 @@ func (c *coordinator) StoreBlock(block *common.Block, privateDataSets util.PvtDa
 		}
 	}
 
+	c.reportPurgeDuration(time.Since(purgeStart))
+
 	return nil
 }
 
 func (c *coordinator) fetchFromPeers(blockSeq uint64, ownedRWsets map[rwSetKey][]byte, privateInfo *privateDataInfo) {
-	dig2src := make(map[*gossip2.PvtDataDigest][]*peer.Endorsement)
+	dig2src := make(map[privdatacommon.DigKey][]*peer.Endorsement)
 	privateInfo.missingKeys.foreach(func(k rwSetKey) {
 		logger.Debug("Fetching", k, "from peers")
-		dig := &gossip2.PvtDataDigest{
+		dig := privdatacommon.DigKey{
 			TxId:       k.txID,
 			SeqInBlock: k.seqInBlock,
 			Collection: k.collection,
@@ -262,7 +290,7 @@ func (c *coordinator) fetchFromPeers(blockSeq uint64, ownedRWsets map[rwSetKey][
 	}
 
 	// Iterate over data fetched from peers
-	for _, element := range fetchedData {
+	for _, element := range fetchedData.AvailableElements {
 		dig := element.Digest
 		for _, rws := range element.Payload {
 			hash := hex.EncodeToString(util2.ComputeSHA256(rws))
@@ -285,6 +313,19 @@ func (c *coordinator) fetchFromPeers(blockSeq uint64, ownedRWsets map[rwSetKey][
 			logger.Debug("Fetched", key)
 		}
 	}
+	// Iterate over purged data
+	for _, dig := range fetchedData.PurgedElements {
+		// delete purged key from missing keys
+		for missingPvtRWKey := range privateInfo.missingKeys {
+			if missingPvtRWKey.namespace == dig.Namespace &&
+				missingPvtRWKey.collection == dig.Collection &&
+				missingPvtRWKey.txID == dig.TxId {
+				delete(privateInfo.missingKeys, missingPvtRWKey)
+				logger.Warningf("Missing key because was purged or will soon be purged, "+
+					"continue block commit without [%+v] in private rwset", missingPvtRWKey)
+			}
+		}
+	}
 }
 
 func (c *coordinator) fetchMissingFromTransientStore(missing rwSetKeysByTxIDs, ownedRWsets map[rwSetKey][]byte) {
@@ -302,20 +343,25 @@ func (c *coordinator) fetchFromTransientStore(txAndSeq txAndSeqInBlock, filter l
 	}
 	defer iterator.Close()
 	for {
-		res, err := iterator.Next()
+		res, err := iterator.NextWithConfig()
 		if err != nil {
-			logger.Warning("Failed iterating:", err)
+			logger.Error("Failed iterating:", err)
 			break
 		}
 		if res == nil {
 			// End of iteration
 			break
 		}
-		if res.PvtSimulationResults == nil {
-			logger.Warning("Resultset's PvtSimulationResults for", txAndSeq.txID, "is nil, skipping")
+		if res.PvtSimulationResultsWithConfig == nil {
+			logger.Warning("Resultset's PvtSimulationResultsWithConfig for", txAndSeq.txID, "is nil, skipping")
 			continue
 		}
-		for _, ns := range res.PvtSimulationResults.NsPvtRwset {
+		simRes := res.PvtSimulationResultsWithConfig
+		if simRes.PvtRwset == nil {
+			logger.Warning("The PvtRwset of PvtSimulationResultsWithConfig for", txAndSeq.txID, "is nil, skipping")
+			continue
+		}
+		for _, ns := range simRes.PvtRwset.NsPvtRwset {
 			for _, col := range ns.CollectionPvtRwset {
 				key := rwSetKey{
 					txID:       txAndSeq.txID,
@@ -506,7 +552,7 @@ func (k *rwSetKey) toTxPvtReadWriteSet(rws []byte) *rwset.TxPvtReadWriteSet {
 
 type txns []string
 type blockData [][]byte
-type blockConsumer func(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, endorsers []*peer.Endorsement)
+type blockConsumer func(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, endorsers []*peer.Endorsement) error
 
 func (data blockData) forEachTxn(txsFilter txValidationFlags, consumer blockConsumer) (txns, error) {
 	var txList []string
@@ -568,7 +614,10 @@ func (data blockData) forEachTxn(txsFilter txValidationFlags, consumer blockCons
 			logger.Warning("Failed obtaining TxRwSet from ChaincodeAction's results", err)
 			continue
 		}
-		consumer(uint64(seqInBlock), chdr, txRWSet, ccActionPayload.Action.Endorsements)
+		err = consumer(uint64(seqInBlock), chdr, txRWSet, ccActionPayload.Action.Endorsements)
+		if err != nil {
+			return txList, err
+		}
 	}
 	return txList, nil
 }
@@ -592,10 +641,11 @@ func endorsersFromOrgs(ns string, col string, endorsers []*peer.Endorsement, org
 }
 
 type privateDataInfo struct {
-	sources            map[rwSetKey][]*peer.Endorsement
-	missingKeysByTxIDs rwSetKeysByTxIDs
-	missingKeys        rwsetKeys
-	txns               txns
+	sources                 map[rwSetKey][]*peer.Endorsement
+	missingKeysByTxIDs      rwSetKeysByTxIDs
+	missingKeys             rwsetKeys
+	txns                    txns
+	missingRWSButIneligible []rwSetKey
 }
 
 // listMissingPrivateData identifies missing private write sets and attempts to retrieve them from local transient store
@@ -621,13 +671,14 @@ func (c *coordinator) listMissingPrivateData(block *common.Block, ownedRWsets ma
 	}
 	txList, err := data.forEachTxn(txsFilter, bi.inspectTransaction)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
 	privateInfo := &privateDataInfo{
-		sources:            sources,
-		missingKeysByTxIDs: missing,
-		txns:               txList,
+		sources:                 sources,
+		missingKeysByTxIDs:      missing,
+		txns:                    txList,
+		missingRWSButIneligible: bi.missingRWSButIneligible,
 	}
 
 	logger.Debug("Retrieving private write sets for", len(privateInfo.missingKeysByTxIDs), "transactions from transient store")
@@ -656,29 +707,51 @@ func (c *coordinator) listMissingPrivateData(block *common.Block, ownedRWsets ma
 
 type transactionInspector struct {
 	*coordinator
-	privateRWsetsInBlock map[rwSetKey]struct{}
-	missingKeys          rwSetKeysByTxIDs
-	sources              map[rwSetKey][]*peer.Endorsement
-	ownedRWsets          map[rwSetKey][]byte
+	privateRWsetsInBlock    map[rwSetKey]struct{}
+	missingKeys             rwSetKeysByTxIDs
+	sources                 map[rwSetKey][]*peer.Endorsement
+	ownedRWsets             map[rwSetKey][]byte
+	missingRWSButIneligible []rwSetKey
 }
 
-func (bi *transactionInspector) inspectTransaction(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, endorsers []*peer.Endorsement) {
+func (bi *transactionInspector) inspectTransaction(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, endorsers []*peer.Endorsement) error {
 	for _, ns := range txRWSet.NsRwSets {
-		for _, hashed := range ns.CollHashedRwSets {
-			policy := bi.accessPolicyForCollection(chdr, ns.NameSpace, hashed.CollectionName)
+		for _, hashedCollection := range ns.CollHashedRwSets {
+			if !containsWrites(chdr.TxId, ns.NameSpace, hashedCollection) {
+				continue
+			}
+
+			// If an error occurred due to the unavailability of database, we should stop committing
+			// blocks for the associated chain. The policy can never be nil for a valid collection.
+			// For collections which were never defined, the policy would be nil and we can safely
+			// move on to the next collection.
+			policy, err := bi.accessPolicyForCollection(chdr, ns.NameSpace, hashedCollection.CollectionName)
+			if err != nil {
+				return &vsccErrors.VSCCExecutionFailureError{Err: err}
+			}
+
 			if policy == nil {
+				logger.Errorf("Failed to retrieve collection config for channel [%s], chaincode [%s], collection name [%s] for txID [%s]. Skipping.",
+					chdr.ChannelId, ns.NameSpace, hashedCollection.CollectionName, chdr.TxId)
 				continue
 			}
-			if !bi.isEligible(policy, ns.NameSpace, hashed.CollectionName) {
-				continue
-			}
+
 			key := rwSetKey{
 				txID:       chdr.TxId,
 				seqInBlock: seqInBlock,
-				hash:       hex.EncodeToString(hashed.PvtRwSetHash),
+				hash:       hex.EncodeToString(hashedCollection.PvtRwSetHash),
 				namespace:  ns.NameSpace,
-				collection: hashed.CollectionName,
+				collection: hashedCollection.CollectionName,
 			}
+
+			if !bi.isEligible(policy, ns.NameSpace, hashedCollection.CollectionName) {
+				logger.Debugf("Peer is not eligible for collection, channel [%s], chaincode [%s], "+
+					"collection name [%s], txID [%s] the policy is [%#v]. Skipping.",
+					chdr.ChannelId, ns.NameSpace, hashedCollection.CollectionName, chdr.TxId, policy)
+				bi.missingRWSButIneligible = append(bi.missingRWSButIneligible, key)
+				continue
+			}
+
 			bi.privateRWsetsInBlock[key] = struct{}{}
 			if _, exists := bi.ownedRWsets[key]; !exists {
 				txAndSeq := txAndSeqInBlock{
@@ -686,15 +759,16 @@ func (bi *transactionInspector) inspectTransaction(seqInBlock uint64, chdr *comm
 					seqInBlock: seqInBlock,
 				}
 				bi.missingKeys[txAndSeq] = append(bi.missingKeys[txAndSeq], key)
-				bi.sources[key] = endorsersFromOrgs(ns.NameSpace, hashed.CollectionName, endorsers, policy.MemberOrgs())
+				bi.sources[key] = endorsersFromOrgs(ns.NameSpace, hashedCollection.CollectionName, endorsers, policy.MemberOrgs())
 			}
 		} // for all hashed RW sets
 	} // for all RW sets
+	return nil
 }
 
 // accessPolicyForCollection retrieves a CollectionAccessPolicy for a given namespace, collection name
 // that corresponds to a given ChannelHeader
-func (c *coordinator) accessPolicyForCollection(chdr *common.ChannelHeader, namespace string, col string) privdata.CollectionAccessPolicy {
+func (c *coordinator) accessPolicyForCollection(chdr *common.ChannelHeader, namespace string, col string) (privdata.CollectionAccessPolicy, error) {
 	cp := common.CollectionCriteria{
 		Channel:    chdr.ChannelId,
 		Namespace:  namespace,
@@ -702,20 +776,17 @@ func (c *coordinator) accessPolicyForCollection(chdr *common.ChannelHeader, name
 		TxId:       chdr.TxId,
 	}
 	sp, err := c.CollectionStore.RetrieveCollectionAccessPolicy(cp)
-	if err != nil {
-		logger.Warning("Failed obtaining policy for", cp, ":", err, "skipping collection")
-		return nil
+
+	if _, isNoSuchCollectionError := err.(privdata.NoSuchCollectionError); err != nil && !isNoSuchCollectionError {
+		logger.Warning("Failed obtaining policy for", cp, "due to database unavailability:", err)
+		return nil, err
 	}
-	return sp
+	return sp, nil
 }
 
 // isEligible checks if this peer is eligible for a given CollectionAccessPolicy
 func (c *coordinator) isEligible(ap privdata.CollectionAccessPolicy, namespace string, col string) bool {
 	filt := ap.AccessFilter()
-	if filt == nil {
-		logger.Warning("Failed parsing policy for namespace", namespace, "collection", col, "skipping collection")
-		return false
-	}
 	eligible := filt(c.selfSignedData)
 	if !eligible {
 		logger.Debug("Skipping namespace", namespace, "collection", col, "because we're not eligible for the private data")
@@ -770,15 +841,15 @@ func (ac aggregatedCollections) asPrivateData() []*ledger.TxPvtData {
 func (c *coordinator) GetPvtDataAndBlockByNum(seqNum uint64, peerAuthInfo common.SignedData) (*common.Block, util.PvtDataCollections, error) {
 	blockAndPvtData, err := c.Committer.GetPvtDataAndBlockByNum(seqNum)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot retrieve block number %d, due to %s", seqNum, err)
+		return nil, nil, err
 	}
 
 	seqs2Namespaces := aggregatedCollections(make(map[seqAndDataModel]map[string][]*rwset.CollectionPvtReadWriteSet))
 	data := blockData(blockAndPvtData.Block.Data.Data)
-	_, err = data.forEachTxn(make(txValidationFlags, len(data)), func(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, _ []*peer.Endorsement) {
-		item, exists := blockAndPvtData.BlockPvtData[seqInBlock]
+	data.forEachTxn(make(txValidationFlags, len(data)), func(seqInBlock uint64, chdr *common.ChannelHeader, txRWSet *rwsetutil.TxRwSet, _ []*peer.Endorsement) error {
+		item, exists := blockAndPvtData.PvtData[seqInBlock]
 		if !exists {
-			return
+			return nil
 		}
 
 		for _, ns := range item.WriteSet.NsPvtRwset {
@@ -806,10 +877,41 @@ func (c *coordinator) GetPvtDataAndBlockByNum(seqNum uint64, peerAuthInfo common
 				seqs2Namespaces.addCollection(seqInBlock, item.WriteSet.DataModel, ns.Namespace, col)
 			}
 		}
+		return nil
 	})
-	if err != nil {
-		return nil, nil, errors.WithStack(err)
-	}
 
 	return blockAndPvtData.Block, seqs2Namespaces.asPrivateData(), nil
+}
+
+func (c *coordinator) reportValidationDuration(time time.Duration) {
+	c.metrics.ValidationDuration.With("channel", c.ChainID).Observe(time.Seconds())
+}
+
+func (c *coordinator) reportListMissingPrivateDataDuration(time time.Duration) {
+	c.metrics.ListMissingPrivateDataDuration.With("channel", c.ChainID).Observe(time.Seconds())
+}
+
+func (c *coordinator) reportFetchDuration(time time.Duration) {
+	c.metrics.FetchDuration.With("channel", c.ChainID).Observe(time.Seconds())
+}
+
+func (c *coordinator) reportCommitDuration(time time.Duration) {
+	c.metrics.CommitPrivateDataDuration.With("channel", c.ChainID).Observe(time.Seconds())
+}
+
+func (c *coordinator) reportPurgeDuration(time time.Duration) {
+	c.metrics.PurgeDuration.With("channel", c.ChainID).Observe(time.Seconds())
+}
+
+// containsWrites checks whether the given CollHashedRwSet contains writes
+func containsWrites(txID string, namespace string, colHashedRWSet *rwsetutil.CollHashedRwSet) bool {
+	if colHashedRWSet.HashedRwSet == nil {
+		logger.Warningf("HashedRWSet of tx %s, namespace %s, collection %s is nil", txID, namespace, colHashedRWSet.CollectionName)
+		return false
+	}
+	if len(colHashedRWSet.HashedRwSet.HashedWrites) == 0 && len(colHashedRWSet.HashedRwSet.MetadataWrites) == 0 {
+		logger.Debugf("HashedRWSet of tx %s, namespace %s, collection %s doesn't contain writes", txID, namespace, colHashedRWSet.CollectionName)
+		return false
+	}
+	return true
 }

@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package comm
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -19,7 +20,6 @@ import (
 
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/config"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -59,30 +59,6 @@ func GetCredentialSupport() *CredentialSupport {
 	return credSupport
 }
 
-// GetServerRootCAs returns the PEM-encoded root certificates for all of the
-// application and orderer organizations defined for all chains.  The root
-// certificates returned should be used to set the trusted server roots for
-// TLS clients.
-func (cas *CASupport) GetServerRootCAs() (appRootCAs, ordererRootCAs [][]byte) {
-	cas.RLock()
-	defer cas.RUnlock()
-
-	appRootCAs = [][]byte{}
-	ordererRootCAs = [][]byte{}
-
-	for _, appRootCA := range cas.AppRootCAsByChain {
-		appRootCAs = append(appRootCAs, appRootCA...)
-	}
-
-	for _, ordererRootCA := range cas.OrdererRootCAsByChain {
-		ordererRootCAs = append(ordererRootCAs, ordererRootCA...)
-	}
-
-	// also need to append statically configured root certs
-	appRootCAs = append(appRootCAs, cas.ServerRootCAs...)
-	return appRootCAs, ordererRootCAs
-}
-
 // GetClientRootCAs returns the PEM-encoded root certificates for all of the
 // application and orderer organizations defined for all chains.  The root
 // certificates returned should be used to set the trusted client roots for
@@ -118,10 +94,14 @@ func (cs *CredentialSupport) GetClientCertificate() tls.Certificate {
 	return cs.clientCert
 }
 
-// GetDeliverServiceCredentials returns GRPC transport credentials for given channel to be used by GRPC
-// clients which communicate with ordering service endpoints.
-// If the channel isn't found, error is returned.
-func (cs *CredentialSupport) GetDeliverServiceCredentials(channelID string) (credentials.TransportCredentials, error) {
+// GetDeliverServiceCredentials returns gRPC transport credentials for given channel
+// to be used by gRPC clients which communicate with ordering service endpoints.
+// If appendStaticRoots is set to true, ServerRootCAs are also included in the
+// credentials.  If the channel isn't found, an error is returned.
+func (cs *CredentialSupport) GetDeliverServiceCredentials(
+	channelID string,
+	appendStaticRoots bool,
+) (credentials.TransportCredentials, error) {
 	cs.RLock()
 	defer cs.RUnlock()
 
@@ -144,10 +124,25 @@ func (cs *CredentialSupport) GetDeliverServiceCredentials(channelID string) (cre
 			if err == nil {
 				certPool.AddCert(cert)
 			} else {
-				commLogger.Warningf("Failed to add root cert to credentials (%s)", err)
+				commLogger.Warningf("Failed to add root cert to credentials: %s", err)
 			}
 		} else {
 			commLogger.Warning("Failed to add root cert to credentials")
+		}
+	}
+	if appendStaticRoots {
+		for _, cert := range cs.ServerRootCAs {
+			block, _ := pem.Decode(cert)
+			if block != nil {
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err == nil {
+					certPool.AddCert(cert)
+				} else {
+					commLogger.Warningf("Failed to add root cert to credentials: %s", err)
+				}
+			} else {
+				commLogger.Warning("Failed to add root cert to credentials")
+			}
 		}
 	}
 	tlsConfig.RootCAs = certPool
@@ -155,25 +150,32 @@ func (cs *CredentialSupport) GetDeliverServiceCredentials(channelID string) (cre
 	return creds, nil
 }
 
-// GetPeerCredentials returns GRPC transport credentials for use by GRPC
+// GetPeerCredentials returns gRPC transport credentials for use by gRPC
 // clients which communicate with remote peer endpoints.
 func (cs *CredentialSupport) GetPeerCredentials() credentials.TransportCredentials {
-	var creds credentials.TransportCredentials
+	cs.RLock()
+	defer cs.RUnlock()
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cs.clientCert},
 	}
 	certPool := x509.NewCertPool()
-	// loop through the server root CAs
-	roots, _ := cs.GetServerRootCAs()
-	for _, root := range roots {
-		err := AddPemToCertPool(root, certPool)
+	appRootCAs := [][]byte{}
+	for _, appRootCA := range cs.AppRootCAsByChain {
+		appRootCAs = append(appRootCAs, appRootCA...)
+	}
+	// also need to append statically configured root certs
+	appRootCAs = append(appRootCAs, cs.ServerRootCAs...)
+	// loop through the app root CAs
+	for _, appRootCA := range appRootCAs {
+		err := AddPemToCertPool(appRootCA, certPool)
 		if err != nil {
 			commLogger.Warningf("Failed adding certificates to peer's client TLS trust pool: %s", err)
 		}
 	}
+
 	tlsConfig.RootCAs = certPool
-	creds = credentials.NewTLS(tlsConfig)
-	return creds
+	return credentials.NewTLS(tlsConfig)
 }
 
 func getEnv(key, def string) string {
@@ -194,7 +196,7 @@ func NewClientConnectionWithAddress(peerAddress string, block bool, tslEnabled b
 		opts = ClientKeepaliveOptions(ka)
 	} else {
 		// set to the default options
-		opts = ClientKeepaliveOptions(DefaultKeepaliveOptions())
+		opts = ClientKeepaliveOptions(DefaultKeepaliveOptions)
 	}
 
 	if tslEnabled {
@@ -205,10 +207,12 @@ func NewClientConnectionWithAddress(peerAddress string, block bool, tslEnabled b
 	if block {
 		opts = append(opts, grpc.WithBlock())
 	}
-	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxRecvMsgSize()),
-		grpc.MaxCallSendMsgSize(MaxSendMsgSize())))
-	ctx := context.Background()
-	ctx, _ = context.WithTimeout(ctx, defaultTimeout)
+	opts = append(opts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(MaxRecvMsgSize),
+		grpc.MaxCallSendMsgSize(MaxSendMsgSize),
+	))
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
 	conn, err := grpc.DialContext(ctx, peerAddress, opts...)
 	if err != nil {
 		return nil, err

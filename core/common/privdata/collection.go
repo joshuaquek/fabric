@@ -7,7 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 package privdata
 
 import (
+	"strings"
+
+	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/protos/common"
+	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
 // Collection defines a common interface for collections
@@ -45,6 +49,18 @@ type CollectionAccessPolicy interface {
 	// MemberOrgs returns the collection's members as MSP IDs. This serves as
 	// a human-readable way of quickly identifying who is part of a collection.
 	MemberOrgs() []string
+
+	// IsMemberOnlyRead returns a true if only collection members can read
+	// the private data
+	IsMemberOnlyRead() bool
+}
+
+// CollectionPersistenceConfigs encapsulates configurations related to persistece of a collection
+type CollectionPersistenceConfigs interface {
+	// BlockToLive returns the number of blocks after which the collection data expires.
+	// For instance if the value is set to 10, a key last modified by block number 100
+	// will be purged at block number 111. A zero value is treated same as MaxUint64
+	BlockToLive() uint64
 }
 
 // Filter defines a rule that filters peers according to data signed by them.
@@ -55,9 +71,18 @@ type CollectionAccessPolicy interface {
 //          False otherwise
 type Filter func(common.SignedData) bool
 
-// CollectionStore retrieves stored collections based on the collection's
-// properties. It works as a collection object factory and takes care of
-// returning a collection object of an appropriate collection type.
+// CollectionStore provides various APIs to retrieves stored collections and perform
+// membership check & read permission check based on the collection's properties.
+// TODO: Refactor CollectionStore - FAB-13082
+// (1) function such as RetrieveCollection() and RetrieveCollectionConfigPackage() are
+//     never used except in mocks and test files.
+// (2) in gossip, at least in 7 different places, the following 3 operations
+//     are repeated which can be avoided by introducing a API called IsAMemberOf().
+//         (i)   retrieves collection access policy by calling RetrieveCollectionAccessPolicy()
+//         (ii)  get the access filter func from the collection access policy
+//         (iii) create the evaluation policy and check for membership
+// (3) we would need a cache in collection store to avoid repeated crypto operation.
+//     This would be simple to implement when we introduce IsAMemberOf() APIs.
 type CollectionStore interface {
 	// GetCollection retrieves the collection in the following way:
 	// If the TxID exists in the ledger, the collection that is returned has the
@@ -69,15 +94,29 @@ type CollectionStore interface {
 	// GetCollectionAccessPolicy retrieves a collection's access policy
 	RetrieveCollectionAccessPolicy(common.CollectionCriteria) (CollectionAccessPolicy, error)
 
-	// RetrieveCollectionConfigPackage retrieves the configuration
-	// for the collection with the supplied criteria
+	// RetrieveCollectionConfigPackage retrieves the whole configuration package
+	// for the chaincode with the supplied criteria
 	RetrieveCollectionConfigPackage(common.CollectionCriteria) (*common.CollectionConfigPackage, error)
+
+	// RetrieveCollectionPersistenceConfigs retrieves the collection's persistence related configurations
+	RetrieveCollectionPersistenceConfigs(common.CollectionCriteria) (CollectionPersistenceConfigs, error)
+
+	// HasReadAccess checks whether the creator of the signedProposal has read permission on a
+	// given collection
+	HasReadAccess(common.CollectionCriteria, *pb.SignedProposal, ledger.QueryExecutor) (bool, error)
+
+	CollectionFilter
+}
+
+type CollectionFilter interface {
+	// AccessFilter retrieves the collection's filter that matches a given channel and a collectionPolicyConfig
+	AccessFilter(channelName string, collectionPolicyConfig *common.CollectionPolicyConfig) (Filter, error)
 }
 
 const (
 	// Collecion-specific constants
 
-	// collectionSeparator is the separator used to build the KVS
+	// CollectionSeparator is the separator used to build the KVS
 	// key storing the collections of a chaincode; note that we are
 	// using as separator a character which is illegal for either the
 	// name or the version of a chaincode so there cannot be any
@@ -88,7 +127,18 @@ const (
 	collectionSuffix = "collection"
 )
 
-// BuildCollectionKVSKey returns the KVS key string for a chaincode, given its name and version
+// BuildCollectionKVSKey constructs the collection config key for a given chaincode name
 func BuildCollectionKVSKey(ccname string) string {
 	return ccname + collectionSeparator + collectionSuffix
+}
+
+// IsCollectionConfigKey detects if a key is a collection key
+func IsCollectionConfigKey(key string) bool {
+	return strings.Contains(key, collectionSeparator)
+}
+
+// GetCCNameFromCollectionConfigKey returns the chaincode name given a collection config key
+func GetCCNameFromCollectionConfigKey(key string) string {
+	splittedKey := strings.Split(key, collectionSeparator)
+	return splittedKey[0]
 }

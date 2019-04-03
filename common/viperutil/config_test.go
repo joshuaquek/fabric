@@ -101,7 +101,8 @@ func TestKafkaVersionDecode(t *testing.T) {
 		{"1", sarama.V1_0_0_0, false},
 		{"1.0", sarama.V1_0_0_0, false},
 		{"1.0.0", sarama.V1_0_0_0, false},
-		{"1.0.1", sarama.V1_0_0_0, true},
+		{"1.0.1", sarama.V1_0_0_0, false},
+		{"2.0.0", sarama.V1_0_0_0, false},
 		{"Malformed", sarama.KafkaVersion{}, true},
 	}
 
@@ -490,4 +491,28 @@ func TestEnhancedExactUnmarshalKey(t *testing.T) {
 		t.Fatalf(`Expected: "%t", Actual: "%t"`, true, uconf.Nested.BoolVar)
 	}
 
+}
+
+func TestDecodeOpaqueField(t *testing.T) {
+	yaml := `---
+Foo: bar
+Hello:
+  World: 42
+`
+	config := viper.New()
+	config.SetConfigType("yaml")
+	if err := config.ReadConfig(bytes.NewReader([]byte(yaml))); err != nil {
+		t.Fatalf("Error reading config: %s", err)
+	}
+	var conf struct {
+		Foo   string
+		Hello struct{ World int }
+	}
+	if err := EnhancedExactUnmarshal(config, &conf); err != nil {
+		t.Fatalf("Error unmashalling: %s", err)
+	}
+
+	if conf.Foo != "bar" || conf.Hello.World != 42 {
+		t.Fatalf("Incorrect decoding")
+	}
 }
